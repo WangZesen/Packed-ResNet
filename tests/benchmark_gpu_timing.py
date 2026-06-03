@@ -36,6 +36,7 @@ class BenchmarkResult:
     name: str
     amp_dtype: str
     compile_mode: str
+    storage_sync: str
     local_batch_size: int
     num_models: int
     global_batch_size: int
@@ -62,7 +63,7 @@ def _time_forward_backward(
     name: str,
     amp_dtype: torch.dtype | None,
     compile_mode: str | None,
-    model: nn.Module,
+    model: WideResNet | PackedWideResNet,
     input: Tensor,
     target: Tensor,
     loss_fn: Callable[[Tensor, Tensor], Tensor],
@@ -70,17 +71,22 @@ def _time_forward_backward(
     num_models: int,
     warmup_steps: int,
     timing_steps: int,
+    include_storage_sync: bool,
 ) -> BenchmarkResult:
     model.train()
+    forward_model: nn.Module = model
     if compile_mode is not None:
-        model = torch.compile(model, mode=compile_mode)  # type: ignore[assignment]
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        forward_model = torch.compile(model, mode=compile_mode)  # type: ignore[assignment]
+    optimizer = torch.optim.SGD(forward_model.parameters(), lr=0.01)
 
     def step() -> None:
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            loss = loss_fn(model(input), target)
+            loss = loss_fn(forward_model(input), target)
         loss.backward()
+        if include_storage_sync:
+            model.sync_storage_from_parameters_()
+            model.sync_parameters_from_storage_()
 
     for _ in range(warmup_steps):
         step()
@@ -104,6 +110,7 @@ def _time_forward_backward(
         name=name,
         amp_dtype="bf16" if amp_dtype is torch.bfloat16 else "fp32",
         compile_mode=compile_mode or "eager",
+        storage_sync="yes" if include_storage_sync else "no",
         local_batch_size=local_batch_size,
         num_models=num_models,
         global_batch_size=global_batch_size,
@@ -131,6 +138,7 @@ def benchmark_single_models(
     compile_mode: str | None,
     warmup_steps: int,
     timing_steps: int,
+    include_storage_sync: bool,
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
     channels, height, width = IMAGE_SHAPE
@@ -158,6 +166,7 @@ def benchmark_single_models(
                 num_models=1,
                 warmup_steps=warmup_steps,
                 timing_steps=timing_steps,
+                include_storage_sync=include_storage_sync,
             )
         )
         del model, input, target
@@ -174,6 +183,7 @@ def benchmark_packed_models(
     compile_mode: str | None,
     warmup_steps: int,
     timing_steps: int,
+    include_storage_sync: bool,
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
     channels, height, width = IMAGE_SHAPE
@@ -203,6 +213,7 @@ def benchmark_packed_models(
                     num_models=num_models,
                     warmup_steps=warmup_steps,
                     timing_steps=timing_steps,
+                    include_storage_sync=include_storage_sync,
                 )
             )
             del model, input, target
@@ -215,6 +226,7 @@ def _print_results(results: list[BenchmarkResult]) -> None:
         "case",
         "amp",
         "compile",
+        "sync",
         "local_B",
         "K",
         "global_B",
@@ -227,15 +239,15 @@ def _print_results(results: list[BenchmarkResult]) -> None:
     )
     print(
         f"{header[0]:<8} {header[1]:<8} {header[2]:<5} {header[3]:<16} "
-        f"{header[4]:>8} {header[5]:>4} {header[6]:>9} {header[7]:>10} "
-        f"{header[8]:>10} {header[9]:>10} {header[10]:>10} {header[11]:>12} "
-        f"{header[12]:>10}"
+        f"{header[4]:<5} {header[5]:>8} {header[6]:>4} {header[7]:>9} "
+        f"{header[8]:>10} {header[9]:>10} {header[10]:>10} {header[11]:>10} "
+        f"{header[12]:>12} {header[13]:>10}"
     )
     for result in results:
         print(
             f"{result.model_name:<8} {result.name:<8} {result.amp_dtype:<5} "
-            f"{result.compile_mode:<16} {result.local_batch_size:>8} "
-            f"{result.num_models:>4} {result.global_batch_size:>9} "
+            f"{result.compile_mode:<16} {result.storage_sync:<5} "
+            f"{result.local_batch_size:>8} {result.num_models:>4} {result.global_batch_size:>9} "
             f"{result.mean_ms:>10.3f} {result.median_ms:>10.3f} "
             f"{result.min_ms:>10.3f} {result.max_ms:>10.3f} "
             f"{result.samples_per_second:>12.1f} {result.peak_memory_mb:>10.1f}"
@@ -303,6 +315,14 @@ def parse_args() -> argparse.Namespace:
         default="default",
         help="torch.compile mode used when --compile is enabled.",
     )
+    parser.add_argument(
+        "--include-storage-sync",
+        action="store_true",
+        help=(
+            "Include one sync_storage_from_parameters_() call and one "
+            "sync_parameters_from_storage_() call in each benchmarked step."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -333,6 +353,7 @@ def main() -> None:
     print(f"torch: {torch.__version__}")
     print(f"models: {', '.join(config.name for config in model_configs)}, input: {IMAGE_SHAPE}")
     print(f"amp: {args.amp}, compile: {compile_mode or 'eager'}")
+    print(f"include_storage_sync: {args.include_storage_sync}")
     print(f"batch_sizes: {args.batch_sizes}, num_models: {args.num_models}")
     print(f"warmup_steps: {args.warmup_steps}, timing_steps: {args.timing_steps}")
 
@@ -347,6 +368,7 @@ def main() -> None:
                 compile_mode=compile_mode,
                 warmup_steps=args.warmup_steps,
                 timing_steps=args.timing_steps,
+                include_storage_sync=args.include_storage_sync,
             )
         )
         results.extend(
@@ -359,6 +381,7 @@ def main() -> None:
                 compile_mode=compile_mode,
                 warmup_steps=args.warmup_steps,
                 timing_steps=args.timing_steps,
+                include_storage_sync=args.include_storage_sync,
             )
         )
     _print_results(results)

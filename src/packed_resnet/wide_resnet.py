@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Callable, Self
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .layers import PackedBatchNorm2d, PackedConv2d, PackedLinear
+
+_PARAMETER_STORAGE_ALIGNMENT = 64
 
 
 def _validate_depth(depth: int) -> int:
@@ -16,6 +20,43 @@ def _validate_depth(depth: int) -> int:
     if blocks_per_stage < 1:
         raise ValueError(f"CIFAR WideResNet depth must be at least 10, got {depth}")
     return blocks_per_stage
+
+
+@dataclass(frozen=True)
+class ParameterStorageEntry:
+    name: str
+    module_name: str
+    parameter_name: str
+    start: int
+    numel: int
+    padded_numel: int
+    shape: tuple[int, ...]
+    is_view: bool
+
+
+def _align_offset(offset: int, alignment: int) -> int:
+    if alignment < 1:
+        raise ValueError(f"alignment must be >= 1, got {alignment}")
+    remainder = offset % alignment
+    return offset if remainder == 0 else offset + alignment - remainder
+
+
+def _get_submodule(model: nn.Module, name: str) -> nn.Module:
+    if not name:
+        return model
+    module = model
+    for atom in name.split("."):
+        module = getattr(module, atom)
+    return module
+
+
+def _set_module_parameter(module: nn.Module, name: str, value: Tensor) -> None:
+    module._parameters[name] = nn.Parameter(value)
+
+
+def _foreach_copy_(destinations: list[Tensor], sources: list[Tensor]) -> None:
+    if destinations:
+        torch._foreach_copy_(destinations, sources)
 
 
 class PackedBasicBlock(nn.Module):
@@ -175,6 +216,12 @@ class WideResNet(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.feature_channels = channels[-1]
+        self.parameter_storage: Tensor
+        self._parameter_storage_layout: tuple[ParameterStorageEntry, ...]
+        self._parameter_tensors: list[Tensor]
+        self._storage_tensors: list[Tensor]
+        self._non_conv_parameter_tensors: list[Tensor]
+        self._non_conv_storage_tensors: list[Tensor]
 
         self.stem = nn.Conv2d(
             in_channels,
@@ -191,6 +238,7 @@ class WideResNet(nn.Module):
         self.classifier = nn.Linear(channels[3], num_classes)
 
         self._reset_parameters()
+        self._init_parameter_storage()
 
     def _reset_parameters(self) -> None:
         for module in self.modules():
@@ -201,6 +249,96 @@ class WideResNet(nn.Module):
             elif isinstance(module, nn.BatchNorm2d):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
+
+    def _make_parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
+        entries: list[ParameterStorageEntry] = []
+        offset = 0
+        for module_name, module in self.named_modules():
+            for parameter_name, parameter in module.named_parameters(recurse=False):
+                name = f"{module_name}.{parameter_name}" if module_name else parameter_name
+                start = _align_offset(offset, _PARAMETER_STORAGE_ALIGNMENT)
+                numel = parameter.numel()
+                padded_numel = _align_offset(numel, _PARAMETER_STORAGE_ALIGNMENT)
+                entries.append(
+                    ParameterStorageEntry(
+                        name=name,
+                        module_name=module_name,
+                        parameter_name=parameter_name,
+                        start=start,
+                        numel=numel,
+                        padded_numel=padded_numel,
+                        shape=tuple(parameter.shape),
+                        is_view=not isinstance(module, nn.Conv2d),
+                    )
+                )
+                offset = start + padded_numel
+        return tuple(entries)
+
+    def _init_parameter_storage(self) -> None:
+        self._parameter_storage_layout = self._make_parameter_storage_layout()
+        numel = self.parameter_storage_numel()
+        first_parameter = next(self.parameters())
+        self.register_buffer(
+            "parameter_storage",
+            torch.zeros(1, numel, device=first_parameter.device, dtype=first_parameter.dtype),
+        )
+        self._bind_parameter_storage_sync_tensors()
+        self.sync_storage_from_parameters_()
+        self._bind_parameter_storage_views()
+        self._bind_parameter_storage_sync_tensors()
+
+    def _bind_parameter_storage_views(self) -> None:
+        for entry in self._parameter_storage_layout:
+            if not entry.is_view:
+                continue
+            module = _get_submodule(self, entry.module_name)
+            view = self.parameter_storage[0, entry.start : entry.start + entry.numel].view(entry.shape)
+            _set_module_parameter(module, entry.parameter_name, view)
+
+    def _bind_parameter_storage_sync_tensors(self) -> None:
+        self._parameter_tensors = []
+        self._storage_tensors = []
+        self._non_conv_parameter_tensors = []
+        self._non_conv_storage_tensors = []
+        for entry in self._parameter_storage_layout:
+            module = _get_submodule(self, entry.module_name)
+            parameter = getattr(module, entry.parameter_name)
+            assert isinstance(parameter, Tensor)
+            segment = self.parameter_storage[0, entry.start : entry.start + entry.numel]
+            storage_tensor = segment.view(entry.shape)
+            self._parameter_tensors.append(parameter)
+            self._storage_tensors.append(storage_tensor)
+            if not isinstance(module, nn.Conv2d):
+                self._non_conv_parameter_tensors.append(parameter)
+                self._non_conv_storage_tensors.append(storage_tensor)
+
+    def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> Self:
+        result = super()._apply(fn, recurse)
+        self._bind_parameter_storage_views()
+        self._bind_parameter_storage_sync_tensors()
+        return result
+
+    def parameter_storage_numel(self) -> int:
+        return max(
+            (entry.start + entry.padded_numel for entry in self._parameter_storage_layout),
+            default=0,
+        )
+
+    def parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
+        return self._parameter_storage_layout
+
+    def sync_storage_from_parameters_(self) -> Self:
+        with torch.no_grad():
+            _foreach_copy_(self._storage_tensors, self._parameter_tensors)
+        return self
+
+    def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self:
+        with torch.no_grad():
+            if include_conv:
+                _foreach_copy_(self._parameter_tensors, self._storage_tensors)
+            else:
+                _foreach_copy_(self._non_conv_parameter_tensors, self._non_conv_storage_tensors)
+        return self
 
     def forward_features(self, input: Tensor) -> Tensor:
         if input.ndim != 4:
@@ -250,6 +388,12 @@ class PackedWideResNet(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.feature_channels = channels[-1]
+        self.parameter_storage: Tensor
+        self._parameter_storage_layout: tuple[ParameterStorageEntry, ...]
+        self._parameter_tensors: list[Tensor]
+        self._storage_tensors: list[Tensor]
+        self._non_conv_parameter_tensors: list[Tensor]
+        self._non_conv_storage_tensors: list[Tensor]
 
         self.stem = PackedConv2d(
             num_models,
@@ -273,6 +417,7 @@ class PackedWideResNet(nn.Module):
         self.classifier = PackedLinear(num_models, channels[3], num_classes)
 
         self._reset_parameters()
+        self._init_parameter_storage()
 
     def _reset_parameters(self) -> None:
         for module in self.modules():
@@ -283,6 +428,158 @@ class PackedWideResNet(nn.Module):
             elif isinstance(module, PackedBatchNorm2d):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
+
+    def _make_parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
+        entries: list[ParameterStorageEntry] = []
+        offset = 0
+        for module_name, module in self.named_modules():
+            if isinstance(module, PackedConv2d):
+                candidates = (("weight", module.weight), ("bias", module.bias))
+                is_view = False
+            elif isinstance(module, PackedBatchNorm2d):
+                candidates = (("weight", module.weight), ("bias", module.bias))
+                is_view = False
+            elif isinstance(module, PackedLinear):
+                candidates = (("weight", module.weight), ("bias", module.bias))
+                is_view = True
+            else:
+                continue
+            for parameter_name, parameter in candidates:
+                if parameter is None:
+                    continue
+                name = f"{module_name}.{parameter_name}" if module_name else parameter_name
+                local_numel = parameter.numel() // self.num_models
+                local_shape = tuple(parameter.shape[1:]) if isinstance(module, PackedLinear) else ()
+                if isinstance(module, PackedConv2d):
+                    local_shape = (
+                        module.local_out_channels,
+                        module.local_in_channels,
+                        *module.kernel_size,
+                    )
+                elif isinstance(module, PackedBatchNorm2d):
+                    local_shape = (module.local_num_features,)
+                start = _align_offset(offset, _PARAMETER_STORAGE_ALIGNMENT)
+                padded_numel = _align_offset(local_numel, _PARAMETER_STORAGE_ALIGNMENT)
+                entries.append(
+                    ParameterStorageEntry(
+                        name=name,
+                        module_name=module_name,
+                        parameter_name=parameter_name,
+                        start=start,
+                        numel=local_numel,
+                        padded_numel=padded_numel,
+                        shape=local_shape,
+                        is_view=is_view,
+                    )
+                )
+                offset = start + padded_numel
+        return tuple(entries)
+
+    def _init_parameter_storage(self) -> None:
+        self._parameter_storage_layout = self._make_parameter_storage_layout()
+        numel = self.parameter_storage_numel()
+        first_parameter = next(self.parameters())
+        self.register_buffer(
+            "parameter_storage",
+            torch.zeros(
+                self.num_models,
+                numel,
+                device=first_parameter.device,
+                dtype=first_parameter.dtype,
+            ),
+        )
+        self._bind_parameter_storage_sync_tensors()
+        self.sync_storage_from_parameters_()
+        self._bind_parameter_storage_views()
+        self._bind_parameter_storage_sync_tensors()
+
+    def _bind_parameter_storage_views(self) -> None:
+        for entry in self._parameter_storage_layout:
+            if not entry.is_view:
+                continue
+            module = _get_submodule(self, entry.module_name)
+            view = self.parameter_storage[:, entry.start : entry.start + entry.numel].view(
+                self.num_models,
+                *entry.shape,
+            )
+            _set_module_parameter(module, entry.parameter_name, view)
+
+    def _bind_parameter_storage_sync_tensors(self) -> None:
+        self._parameter_tensors = []
+        self._storage_tensors = []
+        self._non_conv_parameter_tensors = []
+        self._non_conv_storage_tensors = []
+        for entry in self._parameter_storage_layout:
+            module = _get_submodule(self, entry.module_name)
+            parameter = getattr(module, entry.parameter_name)
+            assert isinstance(parameter, Tensor)
+            segment = self.parameter_storage[:, entry.start : entry.start + entry.numel]
+            if isinstance(module, PackedConv2d):
+                parameter_tensor = parameter.view(self.num_models, *entry.shape)
+                storage_tensor = segment.view(self.num_models, *entry.shape)
+            elif isinstance(module, PackedBatchNorm2d):
+                parameter_tensor = parameter.view(self.num_models, module.local_num_features)
+                storage_tensor = segment.view(self.num_models, module.local_num_features)
+            else:
+                parameter_tensor = parameter
+                storage_tensor = segment.view(self.num_models, *entry.shape)
+            self._parameter_tensors.append(parameter_tensor)
+            self._storage_tensors.append(storage_tensor)
+            if not isinstance(module, PackedConv2d):
+                self._non_conv_parameter_tensors.append(parameter_tensor)
+                self._non_conv_storage_tensors.append(storage_tensor)
+
+    def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> Self:
+        result = super()._apply(fn, recurse)
+        self._bind_parameter_storage_views()
+        self._bind_parameter_storage_sync_tensors()
+        return result
+
+    def parameter_storage_numel(self) -> int:
+        return max(
+            (entry.start + entry.padded_numel for entry in self._parameter_storage_layout),
+            default=0,
+        )
+
+    def parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
+        return self._parameter_storage_layout
+
+    def sync_storage_from_parameters_(self) -> Self:
+        with torch.no_grad():
+            _foreach_copy_(self._storage_tensors, self._parameter_tensors)
+        return self
+
+    def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self:
+        with torch.no_grad():
+            if include_conv:
+                _foreach_copy_(self._parameter_tensors, self._storage_tensors)
+            else:
+                _foreach_copy_(self._non_conv_parameter_tensors, self._non_conv_storage_tensors)
+        return self
+
+    def average(self, model: WideResNet | None = None) -> WideResNet:
+        if model is None:
+            model = WideResNet(
+                depth=self.depth,
+                widen_factor=self.widen_factor,
+                num_classes=self.num_classes,
+                in_channels=self.in_channels,
+            )
+            model.to(device=self.parameter_storage.device, dtype=self.parameter_storage.dtype)
+        elif (
+            model.depth != self.depth
+            or model.widen_factor != self.widen_factor
+            or model.num_classes != self.num_classes
+            or model.in_channels != self.in_channels
+        ):
+            raise ValueError("target model must match packed depth, widen_factor, num_classes, and in_channels")
+        if model.parameter_storage.shape[1] != self.parameter_storage.shape[1]:
+            raise ValueError("target model parameter storage layout does not match packed model")
+
+        with torch.no_grad():
+            model.parameter_storage.copy_(self.parameter_storage.mean(dim=0, keepdim=True))
+        model.sync_parameters_from_storage_()
+        return model
 
     def _pack_input(self, input: Tensor) -> Tensor:
         if input.ndim != 5:
@@ -422,3 +719,4 @@ def copy_single_models_into_packed(
                     if module.bias is not None and source.bias is not None:
                         source_bias = source.bias[0] if isinstance(source, PackedLinear) else source.bias
                         module.bias[model_idx].copy_(source_bias)
+        packed.sync_storage_from_parameters_()
