@@ -24,6 +24,13 @@ def _validate_depth(depth: int) -> int:
 
 @dataclass(frozen=True)
 class ParameterStorageEntry:
+    """Metadata for one parameter segment inside ``parameter_storage``.
+
+    ``start`` and ``numel`` describe the live parameter values. ``padded_numel``
+    includes alignment padding reserved after the live values. Padding is
+    initialized to zero and is not updated by sync calls.
+    """
+
     name: str
     module_name: str
     parameter_name: str
@@ -196,7 +203,21 @@ class NetworkBlock(nn.Sequential):
 
 
 class WideResNet(nn.Module):
-    """Standard CIFAR-style Wide ResNet without packing or dropout."""
+    """Standard CIFAR-style Wide ResNet without packing or dropout.
+
+    This is the non-packed reference model. It owns a ``parameter_storage``
+    buffer shaped ``[1, D]`` so its parameters can use the same flattened
+    storage layout as :class:`PackedWideResNet`.
+
+    Shape:
+        - Input: ``(B, C, H, W)``.
+        - Output: ``(B, num_classes)``.
+
+    Note:
+        BatchNorm and Linear parameters are direct views into
+        ``parameter_storage``. Conv2d parameters remain regular parameters and
+        are copied to/from storage by the sync methods.
+    """
 
     def __init__(
         self,
@@ -205,6 +226,17 @@ class WideResNet(nn.Module):
         num_classes: int = 10,
         in_channels: int = 3,
     ) -> None:
+        """Initialize a standard Wide ResNet.
+
+        Args:
+            depth: Network depth. Must satisfy ``depth = 6n + 4``; common
+                values are ``16`` and ``28``.
+            widen_factor: Width multiplier applied to the CIFAR Wide ResNet
+                channels. Must be at least ``1``.
+            num_classes: Number of classifier output classes. Default: ``10``.
+            in_channels: Number of input image channels. Default: ``3``.
+        """
+
         super().__init__()
         if widen_factor < 1:
             raise ValueError(f"widen_factor must be >= 1, got {widen_factor}")
@@ -278,6 +310,8 @@ class WideResNet(nn.Module):
         self._parameter_storage_layout = self._make_parameter_storage_layout()
         numel = self.parameter_storage_numel()
         first_parameter = next(self.parameters())
+        # Zero initialization leaves alignment padding deterministic without
+        # paying to clear padding again during every sync.
         self.register_buffer(
             "parameter_storage",
             torch.zeros(1, numel, device=first_parameter.device, dtype=first_parameter.dtype),
@@ -319,20 +353,70 @@ class WideResNet(nn.Module):
         return result
 
     def parameter_storage_numel(self) -> int:
+        """Return the aligned storage width ``D`` for ``parameter_storage``.
+
+        Returns:
+            The number of columns in ``parameter_storage``. This can be larger
+            than the raw parameter count because each parameter segment is
+            aligned and may include padding.
+
+        Shape:
+            ``parameter_storage`` has shape ``(1, D)``.
+        """
+
         return max(
             (entry.start + entry.padded_numel for entry in self._parameter_storage_layout),
             default=0,
         )
 
     def parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
+        """Return immutable metadata for mapping parameters into storage.
+
+        Returns:
+            A tuple of :class:`ParameterStorageEntry` values. Each entry
+            describes one parameter segment in a single storage row.
+
+        Note:
+            Use this layout when writing custom mixing kernels that need stable
+            parameter names, offsets, live lengths, and padded lengths.
+        """
+
         return self._parameter_storage_layout
 
     def sync_storage_from_parameters_(self) -> Self:
+        """Copy current model parameters into ``parameter_storage`` in-place.
+
+        Returns:
+            ``self``.
+
+        Note:
+            Call this after optimizer updates and before directly mixing or
+            reading ``parameter_storage``. The method uses cached tensor views
+            and ``torch._foreach_copy_`` to avoid rebuilding tensor lists on
+            every call.
+        """
+
         with torch.no_grad():
             _foreach_copy_(self._storage_tensors, self._parameter_tensors)
         return self
 
     def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self:
+        """Copy ``parameter_storage`` values back into model parameters in-place.
+
+        Args:
+            include_conv: If ``True``, copy all parameter segments, including
+                Conv2d weights. If ``False``, only copy non-Conv2d parameters.
+                Default: ``True``.
+
+        Returns:
+            ``self``.
+
+        Note:
+            Call this after directly modifying ``parameter_storage`` and before
+            the next forward pass. Set ``include_conv=False`` only when Conv2d
+            segments were not changed.
+        """
+
         with torch.no_grad():
             if include_conv:
                 _foreach_copy_(self._parameter_tensors, self._storage_tensors)
@@ -341,6 +425,20 @@ class WideResNet(nn.Module):
         return self
 
     def forward_features(self, input: Tensor) -> Tensor:
+        """Return spatial features before global pooling and classification.
+
+        Args:
+            input: Image tensor.
+
+        Shape:
+            - Input: ``(B, C, H, W)``.
+            - Output: ``(B, feature_channels, H / 4, W / 4)`` for the default
+              CIFAR strides.
+
+        Returns:
+            The final convolutional feature map before global average pooling.
+        """
+
         if input.ndim != 4:
             raise ValueError(f"WideResNet expects [B, C, H, W], got {tuple(input.shape)}")
         if input.shape[1] != self.in_channels:
@@ -352,6 +450,19 @@ class WideResNet(nn.Module):
         return F.relu(self.bn(out), inplace=False)
 
     def forward(self, input: Tensor) -> Tensor:
+        """Return classification logits.
+
+        Args:
+            input: Image tensor.
+
+        Shape:
+            - Input: ``(B, C, H, W)``.
+            - Output: ``(B, num_classes)``.
+
+        Returns:
+            Classification logits.
+        """
+
         out = self.forward_features(input)
         out = F.adaptive_avg_pool2d(out, output_size=1).flatten(1)
         return self.classifier(out)
@@ -360,10 +471,19 @@ class WideResNet(nn.Module):
 class PackedWideResNet(nn.Module):
     """CIFAR-style Wide ResNet packed across independent local models.
 
-    The public input shape is ``[B, K, C, H, W]`` and output shape is
-    ``[B, K, num_classes]``. Internally, convolutional features are viewed as
-    ``[B, K * C, H, W]`` so grouped convolutions and BatchNorm2d can operate
-    without permuting axes.
+    ``K`` local models are represented in one module. Parameters are isolated by
+    grouped convolutions, packed linear weights, and BatchNorm over
+    ``K * channels``.
+
+    Shape:
+        - Input: ``(B, K, C, H, W)``.
+        - Output: ``(B, K, num_classes)``.
+
+    Note:
+        Internally, convolutional features are viewed as ``(B, K * C, H, W)``
+        so grouped convolutions and BatchNorm2d can run without permuting axes.
+        The ``parameter_storage`` buffer has shape ``(K, D)`` for decentralized
+        parameter mixing.
     """
 
     def __init__(
@@ -374,6 +494,20 @@ class PackedWideResNet(nn.Module):
         num_classes: int = 10,
         in_channels: int = 3,
     ) -> None:
+        """Initialize a packed Wide ResNet.
+
+        Args:
+            depth: Network depth. Must satisfy ``depth = 6n + 4``; common
+                values are ``16`` and ``28``.
+            widen_factor: Width multiplier applied to the CIFAR Wide ResNet
+                channels. Must be at least ``1``.
+            num_models: Number of independent local models packed into this
+                module. This is the ``K`` dimension of the input.
+            num_classes: Number of classifier output classes. Default: ``10``.
+            in_channels: Number of channels in each per-model input image.
+                Default: ``3``.
+        """
+
         super().__init__()
         if num_models < 1:
             raise ValueError(f"num_models must be >= 1, got {num_models}")
@@ -479,6 +613,8 @@ class PackedWideResNet(nn.Module):
         self._parameter_storage_layout = self._make_parameter_storage_layout()
         numel = self.parameter_storage_numel()
         first_parameter = next(self.parameters())
+        # Each row stores one local model. Alignment padding starts at zero and
+        # remains untouched by normal sync calls.
         self.register_buffer(
             "parameter_storage",
             torch.zeros(
@@ -536,20 +672,71 @@ class PackedWideResNet(nn.Module):
         return result
 
     def parameter_storage_numel(self) -> int:
+        """Return the aligned per-model storage width ``D``.
+
+        Returns:
+            The number of columns in ``parameter_storage``. This can be larger
+            than the raw per-model parameter count because each segment is
+            aligned and may include padding.
+
+        Shape:
+            ``parameter_storage`` has shape ``(K, D)``.
+        """
+
         return max(
             (entry.start + entry.padded_numel for entry in self._parameter_storage_layout),
             default=0,
         )
 
     def parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
+        """Return immutable metadata for each per-model storage segment.
+
+        Returns:
+            A tuple of :class:`ParameterStorageEntry` values. Each entry
+            describes one per-model parameter segment.
+
+        Note:
+            Each entry maps ``parameter_storage[:, start:start + numel]`` to a
+            parameter for all ``K`` local models. ``padded_numel`` describes the
+            reserved aligned span for that parameter.
+        """
+
         return self._parameter_storage_layout
 
     def sync_storage_from_parameters_(self) -> Self:
+        """Copy packed model parameters into ``parameter_storage`` in-place.
+
+        Returns:
+            ``self``.
+
+        Note:
+            Call this after optimizer updates and before applying decentralized
+            mixing to ``parameter_storage``. The storage shape is ``(K, D)``, so
+            a row-stochastic mixing matrix can be applied as
+            ``parameter_storage.copy_(mixing @ parameter_storage)``.
+        """
+
         with torch.no_grad():
             _foreach_copy_(self._storage_tensors, self._parameter_tensors)
         return self
 
     def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self:
+        """Copy ``parameter_storage`` values back into packed parameters.
+
+        Args:
+            include_conv: If ``True``, copy all parameter segments, including
+                grouped convolution weights. If ``False``, only copy non-Conv2d
+                parameters. Default: ``True``.
+
+        Returns:
+            ``self``.
+
+        Note:
+            Call this after modifying ``parameter_storage`` and before the next
+            forward pass. Set ``include_conv=False`` only when Conv2d segments
+            were not changed.
+        """
+
         with torch.no_grad():
             if include_conv:
                 _foreach_copy_(self._parameter_tensors, self._storage_tensors)
@@ -558,6 +745,22 @@ class PackedWideResNet(nn.Module):
         return self
 
     def average(self, model: WideResNet | None = None) -> WideResNet:
+        """Return or update a ``WideResNet`` with the global parameter average.
+
+        Args:
+            model: Optional target model. If omitted, a matching ``WideResNet``
+                is created on the same device and dtype. If provided, it is
+                updated in-place and returned.
+
+        Returns:
+            A standard ``WideResNet`` whose parameters equal the average across
+            the ``K`` rows of ``parameter_storage``.
+
+        Note:
+            Call ``sync_storage_from_parameters_()`` first if packed parameters
+            may have changed since the last storage sync.
+        """
+
         if model is None:
             model = WideResNet(
                 depth=self.depth,
@@ -592,6 +795,21 @@ class PackedWideResNet(nn.Module):
         return input.reshape(batch, num_models * channels, height, width)
 
     def forward_features(self, input: Tensor) -> Tensor:
+        """Return packed spatial features before pooling and classification.
+
+        Args:
+            input: Packed image tensor where ``K`` equals ``num_models``.
+
+        Shape:
+            - Input: ``(B, K, C, H, W)``.
+            - Output: ``(B, K * feature_channels, H / 4, W / 4)`` for the
+              default CIFAR strides.
+
+        Returns:
+            The final packed convolutional feature map before global average
+            pooling.
+        """
+
         out = self._pack_input(input)
         out = self.stem(out)
         out = self.stage1(out)
@@ -601,6 +819,20 @@ class PackedWideResNet(nn.Module):
         return out
 
     def forward(self, input: Tensor) -> Tensor:
+        """Return packed classification logits.
+
+        Args:
+            input: Packed image tensor where ``K`` equals ``num_models``.
+
+        Shape:
+            - Input: ``(B, K, C, H, W)``.
+            - Output: ``(B, K, num_classes)``.
+
+        Returns:
+            Classification logits. Each ``K`` slice is the prediction of one
+            independent local model.
+        """
+
         out = self.forward_features(input)
         out = F.adaptive_avg_pool2d(out, output_size=1).flatten(1)
         out = out.reshape(input.shape[0], self.num_models, self.feature_channels)
@@ -612,6 +844,18 @@ def packed_wrn_28_10(
     num_classes: int = 10,
     in_channels: int = 3,
 ) -> PackedWideResNet:
+    """Create a packed WRN-28-10.
+
+    Args:
+        num_models: Number of independent local models packed into one module.
+        num_classes: Number of classifier output classes. Default: ``10``.
+        in_channels: Number of channels in each per-model input image.
+            Default: ``3``.
+
+    Returns:
+        A :class:`PackedWideResNet` with ``depth=28`` and ``widen_factor=10``.
+    """
+
     return PackedWideResNet(
         depth=28,
         widen_factor=10,
@@ -626,6 +870,18 @@ def packed_wrn_16_8(
     num_classes: int = 10,
     in_channels: int = 3,
 ) -> PackedWideResNet:
+    """Create a packed WRN-16-8.
+
+    Args:
+        num_models: Number of independent local models packed into one module.
+        num_classes: Number of classifier output classes. Default: ``10``.
+        in_channels: Number of channels in each per-model input image.
+            Default: ``3``.
+
+    Returns:
+        A :class:`PackedWideResNet` with ``depth=16`` and ``widen_factor=8``.
+    """
+
     return PackedWideResNet(
         depth=16,
         widen_factor=8,
@@ -636,6 +892,16 @@ def packed_wrn_16_8(
 
 
 def wrn_28_10(num_classes: int = 10, in_channels: int = 3) -> WideResNet:
+    """Create a standard WRN-28-10.
+
+    Args:
+        num_classes: Number of classifier output classes. Default: ``10``.
+        in_channels: Number of input image channels. Default: ``3``.
+
+    Returns:
+        A :class:`WideResNet` with ``depth=28`` and ``widen_factor=10``.
+    """
+
     return WideResNet(
         depth=28,
         widen_factor=10,
@@ -645,6 +911,16 @@ def wrn_28_10(num_classes: int = 10, in_channels: int = 3) -> WideResNet:
 
 
 def wrn_16_8(num_classes: int = 10, in_channels: int = 3) -> WideResNet:
+    """Create a standard WRN-16-8.
+
+    Args:
+        num_classes: Number of classifier output classes. Default: ``10``.
+        in_channels: Number of input image channels. Default: ``3``.
+
+    Returns:
+        A :class:`WideResNet` with ``depth=16`` and ``widen_factor=8``.
+    """
+
     return WideResNet(
         depth=16,
         widen_factor=8,
@@ -659,8 +935,17 @@ def copy_single_models_into_packed(
 ) -> None:
     """Copy K single WideResNets into one packed model.
 
-    This utility is intended for validation and simulation setup where existing
-    local model weights should be evaluated by one packed module.
+    Args:
+        packed: Target packed model. Its ``num_models`` value must equal
+            ``len(single_models)``.
+        single_models: Source models. Each source may be a standard
+            ``WideResNet`` or a ``PackedWideResNet`` with ``num_models=1``.
+
+    Note:
+        This utility is intended for validation and simulation setup where
+        existing local model weights should be evaluated by one packed module.
+        After the copy, ``packed.parameter_storage`` is synchronized and ready
+        for averaging or decentralized mixing.
     """
 
     if len(single_models) != packed.num_models:
