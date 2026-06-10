@@ -27,15 +27,16 @@ other local model, so all local models start from identical parameters.
 
 `create_dataloader` downloads MNIST, CIFAR10, or CIFAR100 and keeps the complete
 split as `float32` tensors on CUDA when available. Each epoch exactly reproduces
-PyTorch `DistributedSampler` sharding for the selected simulated ranks:
+PyTorch `DistributedSampler` sharding for the selected simulated ranks. The
+factory always downloads missing data under `./data` by default and applies
+standard dataset normalization:
 
 ```python
 from packed_resnet import create_dataloader
 
 loader = create_dataloader(
     "cifar10",
-    root="./data",
-    batch_size=64,       # Per-rank batch size.
+    local_batch_size=64,       # Per-rank batch size.
     world_size=16,
     ranks=[2, 5, 9, 12],
     base_seed=0,
@@ -57,14 +58,15 @@ enabled by default.
 
 Pass `packed=False` for compatibility with a normal single-worker model. This
 mode requires exactly one rank and returns images shaped `[B, C, H, W]` with
-targets shaped `[B]`.
+targets shaped `[B]`. Images are channels-last contiguous by default; pass
+`channels_last=False` for standard contiguous NCHW output.
 
 Benchmark complete dataloader epochs for a world size and number of packed
 ranks with:
 
 ```bash
 uv run python tests/benchmark_dataloader.py --world-size 32 --num-ranks 8
-uv run python tests/benchmark_dataloader.py --dataset cifar100 --world-size 64 --num-ranks 16 --batch-size 128
+uv run python tests/benchmark_dataloader.py --dataset cifar100 --world-size 64 --num-ranks 16 --local-batch-size 128
 uv run python tests/benchmark_dataloader.py --world-size 32 --num-ranks 8 --device cpu --no-augment
 ```
 

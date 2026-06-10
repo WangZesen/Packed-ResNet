@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", choices=("mnist", "cifar10", "cifar100"), default="cifar10")
     parser.add_argument("--root", type=Path, default=Path("./data"))
-    parser.add_argument("--batch-size", type=int, default=64, help="Per-rank batch size.")
+    parser.add_argument("--local-batch-size", type=int, default=64, help="Per-rank batch size.")
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument(
         "--num-ranks",
@@ -97,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--timing-epochs", type=int, default=5)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--augment",
@@ -104,18 +105,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the loader's split-dependent augmentation default.",
     )
-    parser.add_argument(
-        "--normalize",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument("--sampler-drop-last", action="store_true")
     parser.add_argument("--drop-last", action="store_true")
-    parser.add_argument(
-        "--download",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     return parser.parse_args()
 
 
@@ -125,8 +116,8 @@ def main() -> None:
         raise ValueError("--world-size must be >= 1")
     if args.num_ranks < 1 or args.num_ranks > args.world_size:
         raise ValueError("--num-ranks must be in [1, world-size]")
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be >= 1")
+    if args.local_batch_size < 1:
+        raise ValueError("--local-batch-size must be >= 1")
     if args.warmup_epochs < 0:
         raise ValueError("--warmup-epochs must be >= 0")
     if args.timing_epochs < 1:
@@ -139,15 +130,14 @@ def main() -> None:
     loader = create_dataloader(
         args.dataset,
         root=args.root,
-        batch_size=args.batch_size,
+        local_batch_size=args.local_batch_size,
         world_size=args.world_size,
         ranks=ranks,
         base_seed=args.seed,
         train=args.train,
+        channels_last=args.channels_last,
         augment=args.augment,
-        normalize=args.normalize,
         device=device,
-        download=args.download,
         sampler_drop_last=args.sampler_drop_last,
         drop_last=args.drop_last,
     )
@@ -156,8 +146,11 @@ def main() -> None:
     print(f"device: {loader.device}")
     if loader.device.type == "cuda":
         print(f"gpu: {torch.cuda.get_device_name(loader.device)}")
-    print(f"world_size: {args.world_size}, ranks: {args.num_ranks}, batch_size_per_rank: {args.batch_size}")
-    print(f"shuffle: {loader.shuffle}, augment: {loader.augment}, normalize: {loader.normalize}")
+    print(f"world_size: {args.world_size}, ranks: {args.num_ranks}, local_batch_size: {args.local_batch_size}")
+    print(
+        f"shuffle: {loader.shuffle}, augment: {loader.augment}, normalize: {loader.normalize}, "
+        f"channels_last: {loader.channels_last}"
+    )
     print(f"batches_per_epoch: {len(loader)}, samples_per_rank: {loader.num_samples}")
     print(f"warmup_epochs: {args.warmup_epochs}, timing_epochs: {args.timing_epochs}")
 

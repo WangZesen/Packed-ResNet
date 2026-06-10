@@ -24,7 +24,7 @@ def test_indices_exactly_match_distributed_sampler(shuffle: bool, sampler_drop_l
     loader = PackedDataLoader(
         _images(size),
         torch.arange(size),
-        batch_size=3,
+        local_batch_size=3,
         world_size=world_size,
         ranks=[3, 1],
         base_seed=19,
@@ -53,7 +53,7 @@ def test_packed_batches_follow_rank_order_and_are_channels_last() -> None:
     loader = PackedDataLoader(
         _images(12),
         torch.arange(12),
-        batch_size=2,
+        local_batch_size=2,
         world_size=3,
         ranks=[2, 0],
         base_seed=0,
@@ -70,11 +70,38 @@ def test_packed_batches_follow_rank_order_and_are_channels_last() -> None:
     torch.testing.assert_close(images[:, 3:], _images(12)[torch.tensor([0, 3])])
 
 
+@pytest.mark.parametrize("packed", [False, True])
+def test_batches_can_use_standard_contiguous_format(packed: bool) -> None:
+    loader = PackedDataLoader(
+        _images(8),
+        torch.arange(8),
+        local_batch_size=2,
+        world_size=2,
+        ranks=[0, 1] if packed else [0],
+        base_seed=0,
+        packed=packed,
+        channels_last=False,
+        shuffle=False,
+        normalize=False,
+    )
+
+    images, targets = next(iter(loader))
+
+    assert images.is_contiguous()
+    assert not images.is_contiguous(memory_format=torch.channels_last)
+    if packed:
+        assert images.shape == (2, 6, 4, 4)
+        assert targets.tolist() == [[0, 1], [2, 3]]
+    else:
+        assert images.shape == (2, 3, 4, 4)
+        assert targets.tolist() == [0, 2]
+
+
 def test_unpacked_batches_and_validation() -> None:
     loader = PackedDataLoader(
         _images(8),
         torch.arange(8),
-        batch_size=2,
+        local_batch_size=2,
         world_size=2,
         ranks=[1],
         base_seed=0,
@@ -92,7 +119,7 @@ def test_unpacked_batches_and_validation() -> None:
         PackedDataLoader(
             _images(8),
             torch.arange(8),
-            batch_size=2,
+            local_batch_size=2,
             world_size=2,
             ranks=[0, 1],
             base_seed=0,
@@ -103,12 +130,12 @@ def test_unpacked_batches_and_validation() -> None:
 
 def test_drop_last_and_length() -> None:
     keep = PackedDataLoader(
-        _images(10), torch.arange(10), batch_size=2, world_size=3, ranks=[0], base_seed=0, normalize=False
+        _images(10), torch.arange(10), local_batch_size=2, world_size=3, ranks=[0], base_seed=0, normalize=False
     )
     drop_batch = PackedDataLoader(
         _images(10),
         torch.arange(10),
-        batch_size=3,
+        local_batch_size=3,
         world_size=3,
         ranks=[0],
         base_seed=0,
@@ -118,7 +145,7 @@ def test_drop_last_and_length() -> None:
     drop_sampler = PackedDataLoader(
         _images(10),
         torch.arange(10),
-        batch_size=2,
+        local_batch_size=2,
         world_size=3,
         ranks=[0],
         base_seed=0,
@@ -137,7 +164,7 @@ def test_normalization() -> None:
     loader = PackedDataLoader(
         torch.full((4, 1, 2, 2), 0.5),
         torch.arange(4),
-        batch_size=2,
+        local_batch_size=2,
         world_size=1,
         ranks=[0],
         base_seed=0,
@@ -157,7 +184,7 @@ def test_augmentation_is_deterministic_and_rank_stable() -> None:
     common = dict(
         images=images,
         targets=torch.arange(12),
-        batch_size=2,
+        local_batch_size=2,
         world_size=3,
         base_seed=7,
         shuffle=True,
@@ -181,7 +208,7 @@ def test_augmentation_is_deterministic_and_rank_stable() -> None:
     assert not torch.equal(combined_images, next_epoch_images)
 
 
-def test_augmentation_is_independent_of_batch_size() -> None:
+def test_augmentation_is_independent_of_local_batch_size() -> None:
     images = torch.arange(12 * 3 * 32 * 32, dtype=torch.float32).reshape(12, 3, 32, 32)
     common = dict(
         images=images,
@@ -193,8 +220,8 @@ def test_augmentation_is_independent_of_batch_size() -> None:
         augment=True,
         normalize=False,
     )
-    small_batches = PackedDataLoader(batch_size=2, **common)
-    large_batches = PackedDataLoader(batch_size=4, **common)
+    small_batches = PackedDataLoader(local_batch_size=2, **common)
+    large_batches = PackedDataLoader(local_batch_size=4, **common)
 
     small_images, small_targets = zip(*small_batches, strict=True)
     large_images, large_targets = zip(*large_batches, strict=True)
@@ -210,7 +237,7 @@ def test_mnist_augmentation_applies_random_crop_without_horizontal_flip() -> Non
     loader = PackedDataLoader(
         images,
         torch.arange(8),
-        batch_size=4,
+        local_batch_size=4,
         world_size=1,
         ranks=[0],
         base_seed=7,
@@ -259,7 +286,7 @@ def test_factory_loads_supported_datasets(
     loader = create_dataloader(
         dataset_name,
         root="unused",
-        batch_size=2,
+        local_batch_size=2,
         world_size=2,
         ranks=[0, 1],
         base_seed=0,
@@ -272,12 +299,42 @@ def test_factory_loads_supported_datasets(
     assert loader.augment is default_augment
 
 
+def test_factory_forwards_channels_last(monkeypatch: pytest.MonkeyPatch) -> None:
+    received: dict[str, object] = {}
+
+    class FakeDataset:
+        def __init__(self, root: str, train: bool, download: bool) -> None:
+            received.update(root=root, train=train, download=download)
+            self.data = torch.zeros((4, 32, 32, 3), dtype=torch.uint8).numpy()
+            self.targets = list(range(4))
+
+    fake_datasets = SimpleNamespace(MNIST=FakeDataset, CIFAR10=FakeDataset, CIFAR100=FakeDataset)
+    monkeypatch.setitem(sys.modules, "torchvision", SimpleNamespace(datasets=fake_datasets))
+
+    loader = create_dataloader(
+        "cifar10",
+        local_batch_size=2,
+        world_size=1,
+        ranks=[0],
+        base_seed=0,
+        channels_last=False,
+        device="cpu",
+    )
+    images, _ = next(iter(loader))
+
+    assert loader.channels_last is False
+    assert loader.normalize is True
+    assert received == {"root": "./data", "train": True, "download": True}
+    assert images.is_contiguous()
+    assert not images.is_contiguous(memory_format=torch.channels_last)
+
+
 def test_factory_rejects_test_augmentation_and_invalid_configuration() -> None:
     with pytest.raises(ValueError, match="test splits"):
         create_dataloader(
             "cifar10",
             root="unused",
-            batch_size=2,
+            local_batch_size=2,
             world_size=1,
             ranks=[0],
             base_seed=0,
@@ -286,11 +343,11 @@ def test_factory_rejects_test_augmentation_and_invalid_configuration() -> None:
         )
     with pytest.raises(ValueError, match="ranks must be unique"):
         PackedDataLoader(
-            _images(4), torch.arange(4), batch_size=1, world_size=2, ranks=[0, 0], base_seed=0, normalize=False
+            _images(4), torch.arange(4), local_batch_size=1, world_size=2, ranks=[0, 0], base_seed=0, normalize=False
         )
     with pytest.raises(ValueError, match=r"\[0, 2\)"):
         PackedDataLoader(
-            _images(4), torch.arange(4), batch_size=1, world_size=2, ranks=[2], base_seed=0, normalize=False
+            _images(4), torch.arange(4), local_batch_size=1, world_size=2, ranks=[2], base_seed=0, normalize=False
         )
 
 
@@ -299,7 +356,7 @@ def test_cuda_loader_keeps_and_returns_data_on_cuda() -> None:
     loader = PackedDataLoader(
         _images(4).cuda(),
         torch.arange(4),
-        batch_size=2,
+        local_batch_size=2,
         world_size=1,
         ranks=[0],
         base_seed=0,

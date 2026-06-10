@@ -19,18 +19,66 @@ _DATASET_STATS: dict[DatasetName, tuple[tuple[float, ...], tuple[float, ...]]] =
 
 
 class PackedDataLoader:
-    """Iterate deterministic distributed shards as packed image batches."""
+    """Iterate selected deterministic distributed shards as image batches.
+
+    The loader simulates multiple distributed workers in one process. Sampling
+    matches :class:`torch.utils.data.DistributedSampler`: all ranks share the
+    permutation generated from ``base_seed + epoch``, then each selected rank
+    receives its strided shard. Call :meth:`set_epoch` before each epoch.
+
+    Images and all epoch preprocessing remain on the input tensor's device. The
+    complete selected-rank epoch is gathered, augmented, normalized, and packed
+    before inexpensive batch views are yielded.
+
+    Args:
+        images: Floating-point source images shaped ``(N, C, H, W)`` with
+            values in ``[0, 1]``.
+        targets: Class targets shaped ``(N,)``.
+        local_batch_size: Number of samples yielded for each selected rank in
+            one batch.
+        world_size: Total number of simulated distributed workers.
+        ranks: Unique simulated worker ranks to include, in packed output
+            order. Every rank must be in ``[0, world_size)``.
+        base_seed: Base seed for distributed shuffling and rank-stable
+            augmentation.
+        packed: If ``True``, combine selected rank images along the channel
+            dimension. If ``False``, exactly one rank must be selected.
+        channels_last: If ``True``, return channels-last contiguous image
+            tensors. Otherwise return standard contiguous NCHW tensors.
+        shuffle: If ``True``, deterministically shuffle before distributed
+            sharding.
+        augment: If ``True``, apply deterministic padded random crops. CIFAR
+            images additionally receive random horizontal flips.
+        normalize: If ``True``, normalize images using ``mean`` and ``std``.
+        mean: Per-channel normalization means. Required when ``normalize`` is
+            ``True``.
+        std: Per-channel normalization standard deviations. Required when
+            ``normalize`` is ``True``.
+        sampler_drop_last: Match ``DistributedSampler(drop_last=True)`` by
+            dropping the tail needed to make shards evenly divisible.
+        drop_last: Drop each rank's final incomplete local batch.
+
+    Yields:
+        ``(images, targets)`` batches. Packed images have shape
+        ``(B, K * C, H, W)`` and targets have shape ``(B, K)``. Unpacked images
+        have shape ``(B, C, H, W)`` and targets have shape ``(B,)``.
+
+    Raises:
+        ValueError: If tensor shapes, ranks, batch settings, augmentation
+            settings, or normalization statistics are invalid.
+    """
 
     def __init__(
         self,
         images: Tensor,
         targets: Tensor,
         *,
-        batch_size: int,
+        local_batch_size: int,
         world_size: int,
         ranks: Sequence[int],
         base_seed: int,
         packed: bool = True,
+        channels_last: bool = True,
         shuffle: bool = True,
         augment: bool = False,
         normalize: bool = True,
@@ -45,8 +93,8 @@ class PackedDataLoader:
             raise ValueError("images must not be empty")
         if targets.ndim != 1 or targets.shape[0] != images.shape[0]:
             raise ValueError("targets must have shape [N] and match the number of images")
-        if batch_size < 1:
-            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if local_batch_size < 1:
+            raise ValueError(f"local_batch_size must be >= 1, got {local_batch_size}")
         if world_size < 1:
             raise ValueError(f"world_size must be >= 1, got {world_size}")
         if not ranks:
@@ -70,11 +118,12 @@ class PackedDataLoader:
 
         self.images = images
         self.targets = targets.to(device=images.device, dtype=torch.long)
-        self.batch_size = batch_size
+        self.local_batch_size = local_batch_size
         self.world_size = world_size
         self.ranks = tuple(ranks)
         self.base_seed = base_seed
         self.packed = packed
+        self.channels_last = channels_last
         self.shuffle = shuffle
         self.augment = augment
         self._horizontal_flip = images.shape[1:] == (3, 32, 32)
@@ -89,6 +138,8 @@ class PackedDataLoader:
 
     @property
     def device(self) -> torch.device:
+        """Return the device holding the source dataset and yielded batches."""
+
         return self.images.device
 
     def _stat_tensor(self, values: Sequence[float] | None) -> Tensor | None:
@@ -103,12 +154,18 @@ class PackedDataLoader:
         return math.ceil(dataset_size / self.world_size)
 
     def __len__(self) -> int:
+        """Return the number of local batches yielded per epoch."""
+
         if self.drop_last:
-            return self.num_samples // self.batch_size
-        return math.ceil(self.num_samples / self.batch_size)
+            return self.num_samples // self.local_batch_size
+        return math.ceil(self.num_samples / self.local_batch_size)
 
     def set_epoch(self, epoch: int) -> None:
-        """Set the epoch used by deterministic sampling and augmentation."""
+        """Set the epoch used by deterministic sampling and augmentation.
+
+        Args:
+            epoch: Epoch number mixed into sampling and augmentation seeds.
+        """
 
         self.epoch = epoch
 
@@ -148,24 +205,26 @@ class PackedDataLoader:
         return torch.stack(offsets, dim=1), torch.stack(flips, dim=1)
 
     def _augment_batch(self, images: Tensor, offsets: Tensor, flip: Tensor) -> Tensor:
-        batch_size, _, height, width = images.shape
+        num_images, _, height, width = images.shape
         padded = F.pad(images, (4, 4, 4, 4))
         rows = offsets[:, 0, None] + torch.arange(height, device=self.device)[None, :]
         cropped = padded.gather(2, rows[:, None, :, None].expand(-1, images.shape[1], -1, padded.shape[3]))
-        column_order = torch.arange(width, device=self.device).expand(batch_size, -1)
+        column_order = torch.arange(width, device=self.device).expand(num_images, -1)
         if self._horizontal_flip:
             column_order = torch.where(flip[:, None], width - 1 - column_order, column_order)
         columns = offsets[:, 1, None] + column_order
         return cropped.gather(3, columns[:, None, None, :].expand(-1, images.shape[1], height, -1))
 
     def __iter__(self) -> Iterator[tuple[Tensor, Tensor]]:
+        """Materialize the selected-rank epoch and iterate over batch views."""
+
         indices = self._distributed_indices()
         rank_indices = torch.stack(
             [indices[rank : self.total_size : self.world_size] for rank in self.ranks],
             dim=1,
         )
         augmentation_parameters = self._augmentation_parameters()
-        stop = self.num_samples if not self.drop_last else len(self) * self.batch_size
+        stop = self.num_samples if not self.drop_last else len(self) * self.local_batch_size
 
         # Materialize preprocessing once so iteration only slices batch views.
         epoch_indices = rank_indices[:stop].to(self.device)
@@ -183,35 +242,76 @@ class PackedDataLoader:
             epoch_images = (epoch_images - self._mean) / self._std
         if self.packed:
             epoch_images = epoch_images.unflatten(0, (stop, len(self.ranks)))
-            epoch_images = epoch_images.flatten(1, 2).contiguous(memory_format=torch.channels_last)
+            epoch_images = epoch_images.flatten(1, 2)
         else:
             epoch_targets = epoch_targets[:, 0]
+        if self.channels_last:
             epoch_images = epoch_images.contiguous(memory_format=torch.channels_last)
+        else:
+            epoch_images = epoch_images.contiguous()
 
-        for start in range(0, stop, self.batch_size):
-            end = start + self.batch_size
+        for start in range(0, stop, self.local_batch_size):
+            end = start + self.local_batch_size
             yield epoch_images[start:end], epoch_targets[start:end]
 
 
 def create_dataloader(
     dataset: DatasetName,
     *,
-    root: str | Path,
-    batch_size: int,
+    root: str | Path = "./data",
+    local_batch_size: int,
     world_size: int,
     ranks: Sequence[int],
     base_seed: int,
     train: bool = True,
     packed: bool = True,
+    channels_last: bool = True,
     shuffle: bool | None = None,
     augment: bool | None = None,
-    normalize: bool = True,
     device: torch.device | str | None = None,
-    download: bool = True,
     sampler_drop_last: bool = False,
     drop_last: bool = False,
 ) -> PackedDataLoader:
-    """Download a supported dataset and create a GPU-resident packed loader."""
+    """Create a normalized packed loader for MNIST, CIFAR10, or CIFAR100.
+
+    Missing torchvision data is downloaded under ``root``. The complete split
+    is converted to ``float32``, normalized with standard dataset statistics,
+    and stored on ``device``. CUDA is selected automatically when available.
+
+    Args:
+        dataset: Dataset name: ``"mnist"``, ``"cifar10"``, or ``"cifar100"``.
+        root: Dataset download and storage directory. Default: ``"./data"``.
+        local_batch_size: Number of samples per selected simulated rank in one
+            yielded batch.
+        world_size: Total number of simulated distributed workers.
+        ranks: Unique worker ranks to include, in packed output order.
+        base_seed: Base seed for shuffling and deterministic augmentation.
+        train: If ``True``, load the training split. Otherwise load the test
+            split.
+        packed: If ``True``, pack selected rank images along the channel
+            dimension. If ``False``, ``ranks`` must contain exactly one rank.
+        channels_last: If ``True``, yield channels-last contiguous images.
+            Otherwise yield standard contiguous NCHW images.
+        shuffle: Override split-dependent shuffling. By default, training data
+            is shuffled and test data is not.
+        augment: Override split-dependent augmentation. By default, CIFAR
+            training data uses random crops and horizontal flips, while MNIST
+            and test splits are not augmented. Explicit MNIST augmentation
+            applies random crops without flips.
+        device: Dataset storage and output device. By default, use CUDA when
+            available and CPU otherwise.
+        sampler_drop_last: Drop distributed-sampler tail samples instead of
+            padding shards to equal length.
+        drop_last: Drop each rank's final incomplete local batch.
+
+    Returns:
+        A :class:`PackedDataLoader` holding the requested normalized split.
+
+    Raises:
+        ValueError: If the dataset name or split/augmentation combination is
+            unsupported.
+        ImportError: If torchvision is unavailable.
+    """
 
     if dataset not in _DATASET_STATS:
         raise ValueError(f"unsupported dataset {dataset!r}; expected one of {tuple(_DATASET_STATS)}")
@@ -232,7 +332,7 @@ def create_dataloader(
         "cifar10": datasets.CIFAR10,
         "cifar100": datasets.CIFAR100,
     }
-    source = dataset_types[dataset](root=str(root), train=train, download=download)
+    source = dataset_types[dataset](root=str(root), train=train, download=True)
     images = torch.as_tensor(source.data)
     if dataset == "mnist":
         images = images.unsqueeze(1)
@@ -245,14 +345,15 @@ def create_dataloader(
     return PackedDataLoader(
         images,
         targets,
-        batch_size=batch_size,
+        local_batch_size=local_batch_size,
         world_size=world_size,
         ranks=ranks,
         base_seed=base_seed,
         packed=packed,
+        channels_last=channels_last,
         shuffle=train if shuffle is None else shuffle,
         augment=(train and dataset != "mnist") if augment is None else augment,
-        normalize=normalize,
+        normalize=True,
         mean=mean,
         std=std,
         sampler_drop_last=sampler_drop_last,

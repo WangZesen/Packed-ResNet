@@ -752,6 +752,9 @@ def packed_wrn_28_10(
 
     Returns:
         A :class:`PackedWideResNet` with ``depth=28`` and ``widen_factor=10``.
+
+    Raises:
+        ValueError: If ``num_models`` is less than one.
     """
 
     return PackedWideResNet(
@@ -778,6 +781,9 @@ def packed_wrn_16_8(
 
     Returns:
         A :class:`PackedWideResNet` with ``depth=16`` and ``widen_factor=8``.
+
+    Raises:
+        ValueError: If ``num_models`` is less than one.
     """
 
     return PackedWideResNet(
@@ -844,6 +850,11 @@ def copy_single_models_into_packed(
         existing local model weights should be evaluated by one packed module.
         After the copy, ``packed.parameter_storage`` is synchronized and ready
         for averaging or decentralized mixing.
+
+    Raises:
+        ValueError: If the source count does not match ``packed.num_models``, a
+            packed source contains more than one model, or any source
+            architecture does not match the target.
     """
 
     if len(single_models) != packed.num_models:

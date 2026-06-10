@@ -8,7 +8,28 @@ from torch.nn import functional as F
 
 
 class PackedConv2d(nn.Conv2d):
-    """Grouped Conv2d where each group is one local model."""
+    """Apply independent convolutions for packed local models.
+
+    ``num_models`` independent convolutions are represented as one grouped
+    :class:`torch.nn.Conv2d`. Inputs and outputs use contiguous channel groups
+    for each local model.
+
+    Args:
+        num_models: Number of independent local models.
+        in_channels: Input channels per local model.
+        out_channels: Output channels per local model.
+        kernel_size: Convolution kernel size.
+        stride: Convolution stride. Default: ``1``.
+        padding: Implicit zero padding. Default: ``0``.
+        bias: If ``True``, include an independent bias for each model.
+
+    Shape:
+        - Input: ``(B, num_models * in_channels, H, W)``.
+        - Output: ``(B, num_models * out_channels, H_out, W_out)``.
+
+    Raises:
+        ValueError: If ``num_models`` is less than one.
+    """
 
     num_models: int
     local_in_channels: int
@@ -62,7 +83,20 @@ class PackedConv2d(nn.Conv2d):
 
 
 class PackedBatchNorm2d(nn.BatchNorm2d):
-    """BatchNorm2d over the packed channel dimension."""
+    """Apply BatchNorm2d to packed local-model channel groups.
+
+    Each local model owns separate affine parameters and running statistics.
+
+    Args:
+        num_models: Number of independent local models.
+        num_features: Feature channels per local model.
+
+    Shape:
+        - Input and output: ``(B, num_models * num_features, H, W)``.
+
+    Raises:
+        ValueError: If ``num_models`` is less than one.
+    """
 
     num_models: int
     local_num_features: int
@@ -76,7 +110,25 @@ class PackedBatchNorm2d(nn.BatchNorm2d):
 
 
 class PackedLinear(nn.Module):
-    """Independent linear layers for each local model."""
+    """Apply independent linear projections for packed local models.
+
+    Args:
+        num_models: Number of independent local models.
+        in_features: Input features per local model.
+        out_features: Output features per local model.
+        bias: If ``True``, include an independent bias for each model.
+
+    Shape:
+        - Input: ``(B, num_models, in_features)``.
+        - Output: ``(B, num_models, out_features)``.
+
+    Note:
+        Parameters for model 0 are initialized once and copied to every other
+        local model.
+
+    Raises:
+        ValueError: If ``num_models`` is less than one.
+    """
 
     def __init__(
         self,
@@ -115,6 +167,15 @@ class PackedLinear(nn.Module):
                     )
 
     def forward(self, input: Tensor) -> Tensor:
+        """Apply each local model's linear projection.
+
+        Args:
+            input: Packed feature tensor shaped ``(B, K, in_features)``.
+
+        Returns:
+            Packed output tensor shaped ``(B, K, out_features)``.
+        """
+
         if input.ndim != 3:
             raise ValueError(f"PackedLinear expects [B, K, F], got shape {tuple(input.shape)}")
         if input.shape[1] != self.num_models:
