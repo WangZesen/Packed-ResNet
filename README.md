@@ -22,9 +22,6 @@ is fixed when the model is created. Convolutions use channels-last weights and
 packed with one independent weight matrix per local model.
 Packed models initialize model 0 once and broadcast its parameters to every
 other local model, so all local models start from identical parameters.
-Residual blocks fuse each channels-last BatchNorm + ReLU pass into one Triton
-kernel during training and evaluation. Wide ResNet forward execution therefore
-requires CUDA and channels-last FP32, FP16, or BF16 activations.
 
 ## MLP Models
 
@@ -62,7 +59,8 @@ Both `PackedWideResNet` and `WideResNet` provide a contiguous
 - normal models use `[1, D]`
 - each parameter segment is padded to a 64-element boundary
 - BatchNorm running statistics are not included
-- storage is materialized lazily and is excluded from `state_dict()`
+- storage is materialized lazily and is excluded from `state_dict()` and
+  `torch.export`
 
 All trainable parameters own memory independently from `parameter_storage`.
 Synchronize explicitly around mixing:
@@ -80,9 +78,6 @@ Both sync directions copy every trainable parameter using cached physical-layout
 tensor views and `torch._foreach_copy_`. Channels-last convolution weights are
 copied directly without first materializing contiguous-format copies. The same
 sync APIs are available on `WideResNet`.
-
-`torch.export` is not supported because Wide ResNet forward execution directly
-launches Triton kernels that require real CUDA tensors.
 
 To create a standard WideResNet whose parameters are the global average of the
 packed local models:
