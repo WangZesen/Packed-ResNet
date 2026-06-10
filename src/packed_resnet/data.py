@@ -130,48 +130,62 @@ class PackedDataLoader:
             indices = indices[: self.total_size]
         return indices
 
-    def _augment_rank_batch(self, images: Tensor, rank: int, batch_start: int) -> Tensor:
+    def _augmentation_parameters(self) -> tuple[Tensor, Tensor] | None:
         if not self.augment:
-            return images
+            return None
 
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(self.base_seed + self.epoch * 1_000_003 + rank * 10_000_019 + batch_start)
+        offsets: list[Tensor] = []
+        flips: list[Tensor] = []
+        for rank in self.ranks:
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(self.base_seed + self.epoch * 1_000_003 + rank * 10_000_019)
+            offsets.append(torch.randint(0, 9, (self.num_samples, 2), device=self.device, generator=generator))
+            flips.append(torch.rand(self.num_samples, device=self.device, generator=generator) < 0.5)
+        return torch.stack(offsets, dim=1), torch.stack(flips, dim=1)
+
+    def _augment_batch(self, images: Tensor, offsets: Tensor, flip: Tensor) -> Tensor:
         batch_size, _, height, width = images.shape
-        offsets = torch.randint(0, 9, (batch_size, 2), device=self.device, generator=generator)
         padded = F.pad(images, (4, 4, 4, 4))
         rows = offsets[:, 0, None] + torch.arange(height, device=self.device)[None, :]
         cropped = padded.gather(2, rows[:, None, :, None].expand(-1, images.shape[1], -1, padded.shape[3]))
-        columns = offsets[:, 1, None] + torch.arange(width, device=self.device)[None, :]
-        cropped = cropped.gather(3, columns[:, None, None, :].expand(-1, images.shape[1], height, -1))
-        flip = torch.rand(batch_size, device=self.device, generator=generator) < 0.5
-        return torch.where(flip[:, None, None, None], cropped.flip(-1), cropped)
-
-    def _prepare_rank_batch(self, indices: Tensor, rank: int, batch_start: int) -> tuple[Tensor, Tensor]:
-        device_indices = indices.to(self.device)
-        images = self._augment_rank_batch(self.images[device_indices], rank, batch_start)
-        if self.normalize:
-            assert self._mean is not None and self._std is not None
-            images = (images - self._mean) / self._std
-        return images, self.targets[device_indices]
+        column_order = torch.arange(width, device=self.device).expand(batch_size, -1)
+        column_order = torch.where(flip[:, None], width - 1 - column_order, column_order)
+        columns = offsets[:, 1, None] + column_order
+        return cropped.gather(3, columns[:, None, None, :].expand(-1, images.shape[1], height, -1))
 
     def __iter__(self) -> Iterator[tuple[Tensor, Tensor]]:
         indices = self._distributed_indices()
-        rank_indices = [indices[rank : self.total_size : self.world_size] for rank in self.ranks]
+        rank_indices = torch.stack(
+            [indices[rank : self.total_size : self.world_size] for rank in self.ranks],
+            dim=1,
+        )
+        augmentation_parameters = self._augmentation_parameters()
         stop = self.num_samples if not self.drop_last else len(self) * self.batch_size
 
+        # Materialize preprocessing once so iteration only slices batch views.
+        epoch_indices = rank_indices[:stop].to(self.device)
+        epoch_images = self.images[epoch_indices].flatten(0, 1)
+        epoch_targets = self.targets[epoch_indices]
+        if augmentation_parameters is not None:
+            offsets, flips = augmentation_parameters
+            epoch_images = self._augment_batch(
+                epoch_images,
+                offsets[:stop].flatten(0, 1),
+                flips[:stop].flatten(),
+            )
+        if self.normalize:
+            assert self._mean is not None and self._std is not None
+            epoch_images = (epoch_images - self._mean) / self._std
+        if self.packed:
+            epoch_images = epoch_images.unflatten(0, (stop, len(self.ranks)))
+            epoch_images = epoch_images.flatten(1, 2).contiguous(memory_format=torch.channels_last)
+        else:
+            epoch_targets = epoch_targets[:, 0]
+            epoch_images = epoch_images.contiguous(memory_format=torch.channels_last)
+
         for start in range(0, stop, self.batch_size):
-            batches = [
-                self._prepare_rank_batch(local_indices[start : start + self.batch_size], rank, start)
-                for rank, local_indices in zip(self.ranks, rank_indices, strict=True)
-            ]
-            if self.packed:
-                images = torch.stack([batch[0] for batch in batches], dim=1)
-                images = images.flatten(1, 2).contiguous(memory_format=torch.channels_last)
-                targets = torch.stack([batch[1] for batch in batches], dim=1)
-            else:
-                images, targets = batches[0]
-                images = images.contiguous(memory_format=torch.channels_last)
-            yield images, targets
+            end = start + self.batch_size
+            yield epoch_images[start:end], epoch_targets[start:end]
 
 
 def create_dataloader(

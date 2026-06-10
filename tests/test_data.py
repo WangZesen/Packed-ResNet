@@ -181,6 +181,30 @@ def test_augmentation_is_deterministic_and_rank_stable() -> None:
     assert not torch.equal(combined_images, next_epoch_images)
 
 
+def test_augmentation_is_independent_of_batch_size() -> None:
+    images = torch.arange(12 * 3 * 32 * 32, dtype=torch.float32).reshape(12, 3, 32, 32)
+    common = dict(
+        images=images,
+        targets=torch.arange(12),
+        world_size=2,
+        ranks=[0, 1],
+        base_seed=7,
+        shuffle=True,
+        augment=True,
+        normalize=False,
+    )
+    small_batches = PackedDataLoader(batch_size=2, **common)
+    large_batches = PackedDataLoader(batch_size=4, **common)
+
+    small_images, small_targets = zip(*small_batches, strict=True)
+    large_images, large_targets = zip(*large_batches, strict=True)
+
+    torch.testing.assert_close(torch.cat(small_images), torch.cat(large_images))
+    torch.testing.assert_close(torch.cat(small_targets), torch.cat(large_targets))
+    assert all(batch.is_contiguous(memory_format=torch.channels_last) for batch in small_images)
+    assert all(batch.is_contiguous(memory_format=torch.channels_last) for batch in large_images)
+
+
 @pytest.mark.parametrize(
     ("dataset_name", "shape", "channels", "default_augment"),
     [
