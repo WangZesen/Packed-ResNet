@@ -23,6 +23,17 @@ def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
 
 
+def _assert_local_parameters_identical(model: PackedWideResNet) -> None:
+    for parameter in model.parameters():
+        local_parameters = parameter.view(model.num_models, -1)
+        torch.testing.assert_close(
+            local_parameters,
+            local_parameters[0].unsqueeze(0).expand_as(local_parameters),
+            rtol=0,
+            atol=0,
+        )
+
+
 def test_forward_shape() -> None:
     model = PackedWideResNet(depth=10, widen_factor=1, num_models=3, num_classes=7)
     x = torch.randn(2, 3, 3, 32, 32)
@@ -30,6 +41,12 @@ def test_forward_shape() -> None:
     logits = model(x)
 
     assert logits.shape == (2, 3, 7)
+
+
+def test_packed_wide_resnet_initializes_all_local_models_identically() -> None:
+    model = PackedWideResNet(depth=10, widen_factor=1, num_models=4, num_classes=7)
+
+    _assert_local_parameters_identical(model)
 
 
 def test_wide_resnet_forward_shape() -> None:
@@ -50,40 +67,101 @@ def test_parameter_count_scales_exactly_with_num_models() -> None:
     assert _num_parameters(packed) == 4 * _num_parameters(normal)
 
 
-def test_parameter_storage_shapes_state_and_alignment() -> None:
+def test_parameter_storage_is_lazy_non_persistent_and_aligned() -> None:
     packed = PackedWideResNet(depth=10, widen_factor=1, num_models=3, num_classes=5)
     normal = WideResNet(depth=10, widen_factor=1, num_classes=5)
+
+    assert packed._parameter_storage is None
+    assert normal._parameter_storage is None
+    assert "_parameter_storage" not in packed.state_dict()
+    assert "_parameter_storage" not in normal.state_dict()
 
     assert packed.parameter_storage.shape == (3, packed.parameter_storage_numel())
     assert normal.parameter_storage.shape == (1, normal.parameter_storage_numel())
     assert packed.parameter_storage.shape[1] == normal.parameter_storage.shape[1]
-    assert "parameter_storage" in packed.state_dict()
-    assert "parameter_storage" in normal.state_dict()
 
-    for model in (packed, normal):
-        for entry in model.parameter_storage_layout():
-            assert entry.start % 64 == 0
-            assert entry.padded_numel % 64 == 0
-            padding = model.parameter_storage[:, entry.start + entry.numel : entry.start + entry.padded_numel]
+    for model, num_models in ((packed, packed.num_models), (normal, 1)):
+        assert model._parameter_names == tuple(name for name, _ in model.named_parameters())
+        assert len(model._parameter_names) == len(model._storage_tensors)
+        offset = 0
+        for parameter in model.parameters():
+            local_numel = parameter.numel() // num_models
+            padded_numel = (local_numel + 63) // 64 * 64
+            padding = model.parameter_storage[:, offset + local_numel : offset + padded_numel]
             assert torch.count_nonzero(padding) == 0
+            offset += padded_numel
+        assert offset == model.parameter_storage.shape[1]
 
 
-def test_parameter_storage_views_for_supported_parameters() -> None:
+def test_loading_state_dict_invalidates_materialized_parameter_storage() -> None:
+    source = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=5)
+    target = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=5)
+    source_parent = torch.nn.ModuleDict({"model": source})
+    target_parent = torch.nn.ModuleDict({"model": target})
+    target.parameter_storage.zero_()
+
+    target_parent.load_state_dict(source_parent.state_dict())
+
+    assert target._parameter_storage is None
+    target_storage = target.parameter_storage
+    source_storage = source.parameter_storage
+    torch.testing.assert_close(target_storage, source_storage)
+
+
+def test_parameter_storage_is_excluded_from_torch_export() -> None:
+    model = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=5).eval()
+    model.parameter_storage
+
+    exported = torch.export.export(model, (torch.randn(1, 2, 3, 32, 32),))
+
+    assert all("parameter_storage" not in name for name in exported.state_dict)
+    assert all("parameter_storage" not in name for name in exported.constants)
+
+
+def test_parameters_are_independent_from_parameter_storage() -> None:
     packed = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=5)
     normal = WideResNet(depth=10, widen_factor=1, num_classes=5)
 
-    assert _storage_ptr(packed.classifier.weight) == _storage_ptr(packed.parameter_storage)
-    assert packed.classifier.bias is not None
-    assert _storage_ptr(packed.classifier.bias) == _storage_ptr(packed.parameter_storage)
-    assert _storage_ptr(normal.bn.weight) == _storage_ptr(normal.parameter_storage)
-    assert _storage_ptr(normal.bn.bias) == _storage_ptr(normal.parameter_storage)
-    assert _storage_ptr(normal.classifier.weight) == _storage_ptr(normal.parameter_storage)
-    assert normal.classifier.bias is not None
-    assert _storage_ptr(normal.classifier.bias) == _storage_ptr(normal.parameter_storage)
+    for model in (packed, normal):
+        storage_ptr = _storage_ptr(model.parameter_storage)
+        assert all(_storage_ptr(parameter) != storage_ptr for parameter in model.parameters())
 
-    converted = packed.to(dtype=torch.float64)
-    assert converted.parameter_storage.dtype == torch.float64
-    assert _storage_ptr(converted.classifier.weight) == _storage_ptr(converted.parameter_storage)
+        converted = model.to(dtype=torch.float64)
+        converted_storage_ptr = _storage_ptr(converted.parameter_storage)
+        assert converted.parameter_storage.dtype == torch.float64
+        assert all(
+            _storage_ptr(parameter) != converted_storage_ptr for parameter in converted.parameters()
+        )
+
+
+def test_parameter_storage_changes_only_through_explicit_sync() -> None:
+    torch.manual_seed(0)
+    models = [
+        PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=5),
+        WideResNet(depth=10, widen_factor=1, num_classes=5),
+    ]
+
+    for model in models:
+        storage_before = model.parameter_storage.detach().clone()
+        parameter_before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+        changed_name, changed_parameter = next(iter(model.named_parameters()))
+
+        with torch.no_grad():
+            changed_parameter.add_(1)
+        torch.testing.assert_close(model.parameter_storage, storage_before)
+
+        model.sync_storage_from_parameters_()
+        assert not torch.equal(model.parameter_storage, storage_before)
+
+        with torch.no_grad():
+            model.parameter_storage.zero_()
+        for name, parameter in model.named_parameters():
+            expected = parameter_before[name] + (1 if name == changed_name else 0)
+            torch.testing.assert_close(parameter, expected)
+
+        model.sync_parameters_from_storage_()
+        for parameter in model.parameters():
+            assert torch.count_nonzero(parameter) == 0
 
 
 def test_parameter_storage_round_trip_preserves_parameters() -> None:
@@ -226,6 +304,41 @@ def test_gradient_isolation_between_local_models() -> None:
     assert classifier.weight.grad is not None
     assert torch.count_nonzero(classifier.weight.grad[0]) > 0
     assert torch.count_nonzero(classifier.weight.grad[1]) == 0
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_packed_linear_matches_independent_linear_layers(bias: bool) -> None:
+    torch.manual_seed(0)
+    layer = PackedLinear(num_models=3, in_features=7, out_features=5, bias=bias)
+    input = torch.randn(4, 3, 7, requires_grad=True)
+    reference_input = input.detach().clone().requires_grad_()
+    reference_weight = layer.weight.detach().clone().requires_grad_()
+    reference_bias = (
+        layer.bias.detach().clone().requires_grad_() if layer.bias is not None else None
+    )
+
+    output = layer(input)
+    reference_output = torch.stack(
+        [
+            torch.nn.functional.linear(
+                reference_input[:, model_idx],
+                reference_weight[model_idx],
+                None if reference_bias is None else reference_bias[model_idx],
+            )
+            for model_idx in range(layer.num_models)
+        ],
+        dim=1,
+    )
+    output_gradient = torch.randn_like(output)
+    output.backward(output_gradient)
+    reference_output.backward(output_gradient)
+
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(input.grad, reference_input.grad)
+    torch.testing.assert_close(layer.weight.grad, reference_weight.grad)
+    if layer.bias is not None:
+        assert reference_bias is not None
+        torch.testing.assert_close(layer.bias.grad, reference_bias.grad)
 
 
 def test_invalid_shapes_raise_clear_errors() -> None:

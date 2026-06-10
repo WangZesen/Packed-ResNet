@@ -31,4 +31,4 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.ruff]
-line-length = 100
+line-length = 120

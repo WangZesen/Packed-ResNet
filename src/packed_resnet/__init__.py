@@ -1,5 +1,7 @@
 from .layers import PackedBatchNorm2d, PackedConv2d, PackedLinear
-from .wide_resnet import (
+from .models import (
+    MLP,
+    PackedMLP,
     PackedWideResNet,
     WideResNet,
     copy_single_models_into_packed,
@@ -13,6 +15,8 @@ __all__ = [
     "PackedBatchNorm2d",
     "PackedConv2d",
     "PackedLinear",
+    "MLP",
+    "PackedMLP",
     "PackedWideResNet",
     "WideResNet",
     "copy_single_models_into_packed",

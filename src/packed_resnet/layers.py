@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 class PackedConv2d(nn.Conv2d):
@@ -37,6 +38,27 @@ class PackedConv2d(nn.Conv2d):
             bias=bias,
             groups=num_models,
         )
+
+    def reset_parameters(self) -> None:
+        super().reset_parameters()
+        self.broadcast_parameters_()
+
+    def broadcast_parameters_(self) -> None:
+        """Copy model-0 parameters to every other packed local model."""
+
+        if self.num_models == 1:
+            return
+        with torch.no_grad():
+            weight = self.weight.view(
+                self.num_models,
+                self.local_out_channels,
+                self.local_in_channels,
+                *self.kernel_size,
+            )
+            weight[1:].copy_(weight[0].unsqueeze(0).expand_as(weight[1:]))
+            if self.bias is not None:
+                bias = self.bias.view(self.num_models, self.local_out_channels)
+                bias[1:].copy_(bias[0].unsqueeze(0).expand_as(bias[1:]))
 
 
 class PackedBatchNorm2d(nn.BatchNorm2d):
@@ -77,11 +99,20 @@ class PackedLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for weight in self.weight:
-            nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.weight[0], a=math.sqrt(5))
+        if self.num_models > 1:
+            with torch.no_grad():
+                self.weight[1:].copy_(
+                    self.weight[0].unsqueeze(0).expand_as(self.weight[1:])
+                )
         if self.bias is not None:
             bound = 1 / math.sqrt(self.in_features)
-            nn.init.uniform_(self.bias, -bound, bound)
+            nn.init.uniform_(self.bias[0], -bound, bound)
+            if self.num_models > 1:
+                with torch.no_grad():
+                    self.bias[1:].copy_(
+                        self.bias[0].unsqueeze(0).expand_as(self.bias[1:])
+                    )
 
     def forward(self, input: Tensor) -> Tensor:
         if input.ndim != 3:
@@ -94,7 +125,151 @@ class PackedLinear(nn.Module):
             raise ValueError(
                 f"PackedLinear expected F={self.in_features}, got F={input.shape[2]}"
             )
-        output = torch.einsum("bkf,kof->bko", input, self.weight)
+        output = torch.bmm(input.transpose(0, 1), self.weight.transpose(1, 2))
         if self.bias is not None:
-            output = output + self.bias.unsqueeze(0)
-        return output
+            output = output + self.bias.unsqueeze(1)
+        return output.transpose(0, 1)
+
+
+class PackedBasicBlock(nn.Module):
+    """Pre-activation residual block for packed local models."""
+
+    def __init__(
+        self,
+        num_models: int,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+    ) -> None:
+        super().__init__()
+        self.bn1 = PackedBatchNorm2d(num_models, in_channels)
+        self.conv1 = PackedConv2d(
+            num_models,
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = PackedBatchNorm2d(num_models, out_channels)
+        self.conv2 = PackedConv2d(
+            num_models,
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.shortcut: PackedConv2d | None
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = PackedConv2d(
+                num_models,
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+            )
+        else:
+            self.shortcut = None
+
+    def forward(self, input: Tensor) -> Tensor:
+        out = self.conv1(F.relu(self.bn1(input), inplace=False))
+        out = self.conv2(F.relu(self.bn2(out), inplace=False))
+        residual = input if self.shortcut is None else self.shortcut(input)
+        return out + residual
+
+
+class PackedNetworkBlock(nn.Sequential):
+    """Sequence of packed residual blocks."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_models: int,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+    ) -> None:
+        layers: list[PackedBasicBlock] = []
+        for layer_idx in range(num_layers):
+            layers.append(
+                PackedBasicBlock(
+                    num_models=num_models,
+                    in_channels=in_channels if layer_idx == 0 else out_channels,
+                    out_channels=out_channels,
+                    stride=stride if layer_idx == 0 else 1,
+                )
+            )
+        super().__init__(*layers)
+
+
+class BasicBlock(nn.Module):
+    """Pre-activation residual block for a standard Wide ResNet."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+    ) -> None:
+        super().__init__()
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.shortcut: nn.Conv2d | None
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+            )
+        else:
+            self.shortcut = None
+
+    def forward(self, input: Tensor) -> Tensor:
+        out = self.conv1(F.relu(self.bn1(input), inplace=False))
+        out = self.conv2(F.relu(self.bn2(out), inplace=False))
+        residual = input if self.shortcut is None else self.shortcut(input)
+        return out + residual
+
+
+class NetworkBlock(nn.Sequential):
+    """Sequence of standard residual blocks."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+    ) -> None:
+        layers: list[BasicBlock] = []
+        for layer_idx in range(num_layers):
+            layers.append(
+                BasicBlock(
+                    in_channels=in_channels if layer_idx == 0 else out_channels,
+                    out_channels=out_channels,
+                    stride=stride if layer_idx == 0 else 1,
+                )
+            )
+        super().__init__(*layers)

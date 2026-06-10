@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Callable, Self
+from itertools import pairwise
+from typing import Any, Callable, Self
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .layers import PackedBatchNorm2d, PackedConv2d, PackedLinear
+from .layers import (
+    NetworkBlock,
+    PackedBatchNorm2d,
+    PackedConv2d,
+    PackedLinear,
+    PackedNetworkBlock,
+)
 
 _PARAMETER_STORAGE_ALIGNMENT = 64
 
@@ -22,25 +28,6 @@ def _validate_depth(depth: int) -> int:
     return blocks_per_stage
 
 
-@dataclass(frozen=True)
-class ParameterStorageEntry:
-    """Metadata for one parameter segment inside ``parameter_storage``.
-
-    ``start`` and ``numel`` describe the live parameter values. ``padded_numel``
-    includes alignment padding reserved after the live values. Padding is
-    initialized to zero and is not updated by sync calls.
-    """
-
-    name: str
-    module_name: str
-    parameter_name: str
-    start: int
-    numel: int
-    padded_numel: int
-    shape: tuple[int, ...]
-    is_view: bool
-
-
 def _align_offset(offset: int, alignment: int) -> int:
     if alignment < 1:
         raise ValueError(f"alignment must be >= 1, got {alignment}")
@@ -48,175 +35,157 @@ def _align_offset(offset: int, alignment: int) -> int:
     return offset if remainder == 0 else offset + alignment - remainder
 
 
-def _get_submodule(model: nn.Module, name: str) -> nn.Module:
-    if not name:
-        return model
-    module = model
-    for atom in name.split("."):
-        module = getattr(module, atom)
-    return module
-
-
-def _set_module_parameter(module: nn.Module, name: str, value: Tensor) -> None:
-    module._parameters[name] = nn.Parameter(value)
-
-
 def _foreach_copy_(destinations: list[Tensor], sources: list[Tensor]) -> None:
     if destinations:
         torch._foreach_copy_(destinations, sources)
 
 
-class PackedBasicBlock(nn.Module):
+class MLP(nn.Module):
+    """Standard single-model multi-layer perceptron.
+
+    Activations are applied after every hidden layer, but not after the output
+    layer.
+
+    Shape:
+        - Input: ``(B, in_features)``.
+        - Output: ``(B, out_features)``.
+    """
+
     def __init__(
         self,
-        num_models: int,
-        in_channels: int,
-        out_channels: int,
-        stride: int,
+        in_features: int,
+        hidden_features: Sequence[int],
+        out_features: int,
+        activation_layer: Callable[[], nn.Module] = nn.ReLU,
+        bias: bool = True,
     ) -> None:
+        """Initialize a single-model multi-layer perceptron.
+
+        Args:
+            in_features: Number of input features.
+            hidden_features: Width of each hidden layer. An empty sequence
+                creates a single linear projection.
+            out_features: Number of output features.
+            activation_layer: Factory that creates the activation module used
+                after every hidden layer. Default: :class:`torch.nn.ReLU`.
+            bias: If ``True``, each linear layer has a bias. Default: ``True``.
+        """
+
         super().__init__()
-        self.bn1 = PackedBatchNorm2d(num_models, in_channels)
-        self.conv1 = PackedConv2d(
-            num_models,
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            bias=False,
+        features = (in_features, *hidden_features, out_features)
+        if any(width < 1 for width in features):
+            raise ValueError(f"all feature widths must be >= 1, got {features}")
+
+        self.in_features = in_features
+        self.hidden_features = tuple(hidden_features)
+        self.out_features = out_features
+        self.layers = nn.ModuleList(
+            [
+                nn.Linear(input_width, output_width, bias=bias)
+                for input_width, output_width in pairwise(features)
+            ]
         )
-        self.bn2 = PackedBatchNorm2d(num_models, out_channels)
-        self.conv2 = PackedConv2d(
-            num_models,
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
+        self.activations = nn.ModuleList(
+            [activation_layer() for _ in self.hidden_features]
         )
-        self.shortcut: PackedConv2d | None
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = PackedConv2d(
-                num_models,
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=stride,
-                bias=False,
-            )
-        else:
-            self.shortcut = None
 
     def forward(self, input: Tensor) -> Tensor:
-        out = self.conv1(F.relu(self.bn1(input), inplace=False))
-        out = self.conv2(F.relu(self.bn2(out), inplace=False))
-        residual = input if self.shortcut is None else self.shortcut(input)
-        return out + residual
+        """Return MLP outputs for input shaped ``(B, in_features)``."""
+
+        if input.ndim != 2:
+            raise ValueError(f"MLP expects [B, F], got shape {tuple(input.shape)}")
+        if input.shape[1] != self.in_features:
+            raise ValueError(f"MLP expected F={self.in_features}, got F={input.shape[1]}")
+
+        output = input
+        for layer, activation in zip(self.layers[:-1], self.activations, strict=True):
+            output = activation(layer(output))
+        return self.layers[-1](output)
 
 
-class PackedNetworkBlock(nn.Sequential):
+class PackedMLP(nn.Module):
+    """Independent multi-layer perceptrons packed across local models.
+
+    Each local model has independent weights and biases. Activations are
+    applied after every hidden layer, but not after the output layer.
+
+    Shape:
+        - Input: ``(B, K, in_features)``.
+        - Output: ``(B, K, out_features)``.
+    """
+
     def __init__(
         self,
-        num_layers: int,
         num_models: int,
-        in_channels: int,
-        out_channels: int,
-        stride: int,
+        in_features: int,
+        hidden_features: Sequence[int],
+        out_features: int,
+        activation_layer: Callable[[], nn.Module] = nn.ReLU,
+        bias: bool = True,
     ) -> None:
-        layers: list[PackedBasicBlock] = []
-        for layer_idx in range(num_layers):
-            layers.append(
-                PackedBasicBlock(
+        """Initialize a packed multi-layer perceptron.
+
+        Args:
+            num_models: Number of independent local models, represented by the
+                ``K`` input dimension.
+            in_features: Number of features in each local model input.
+            hidden_features: Width of each hidden layer. An empty sequence
+                creates a single packed linear projection.
+            out_features: Number of features in each local model output.
+            activation_layer: Factory that creates the activation module used
+                after every hidden layer. Default: :class:`torch.nn.ReLU`.
+            bias: If ``True``, each packed linear layer has a bias.
+                Default: ``True``.
+        """
+
+        super().__init__()
+        features = (in_features, *hidden_features, out_features)
+        if any(width < 1 for width in features):
+            raise ValueError(f"all feature widths must be >= 1, got {features}")
+
+        self.num_models = num_models
+        self.in_features = in_features
+        self.hidden_features = tuple(hidden_features)
+        self.out_features = out_features
+        self.layers = nn.ModuleList(
+            [
+                PackedLinear(
                     num_models=num_models,
-                    in_channels=in_channels if layer_idx == 0 else out_channels,
-                    out_channels=out_channels,
-                    stride=stride if layer_idx == 0 else 1,
+                    in_features=input_width,
+                    out_features=output_width,
+                    bias=bias,
                 )
-            )
-        super().__init__(*layers)
-
-
-class BasicBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int,
-    ) -> None:
-        super().__init__()
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.conv1 = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            bias=False,
+                for input_width, output_width in pairwise(features)
+            ]
         )
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
+        self.activations = nn.ModuleList(
+            [activation_layer() for _ in self.hidden_features]
         )
-        self.shortcut: nn.Conv2d | None
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=stride,
-                bias=False,
-            )
-        else:
-            self.shortcut = None
 
     def forward(self, input: Tensor) -> Tensor:
-        out = self.conv1(F.relu(self.bn1(input), inplace=False))
-        out = self.conv2(F.relu(self.bn2(out), inplace=False))
-        residual = input if self.shortcut is None else self.shortcut(input)
-        return out + residual
+        """Return packed MLP outputs for input shaped ``(B, K, in_features)``."""
 
-
-class NetworkBlock(nn.Sequential):
-    def __init__(
-        self,
-        num_layers: int,
-        in_channels: int,
-        out_channels: int,
-        stride: int,
-    ) -> None:
-        layers: list[BasicBlock] = []
-        for layer_idx in range(num_layers):
-            layers.append(
-                BasicBlock(
-                    in_channels=in_channels if layer_idx == 0 else out_channels,
-                    out_channels=out_channels,
-                    stride=stride if layer_idx == 0 else 1,
-                )
-            )
-        super().__init__(*layers)
+        output = input
+        for layer, activation in zip(self.layers[:-1], self.activations, strict=True):
+            output = activation(layer(output))
+        return self.layers[-1](output)
 
 
 class WideResNet(nn.Module):
     """Standard CIFAR-style Wide ResNet without packing or dropout.
 
-    This is the non-packed reference model. It owns a ``parameter_storage``
-    buffer shaped ``[1, D]`` so its parameters can use the same flattened
-    storage layout as :class:`PackedWideResNet`.
+    This is the non-packed reference model. It lazily provides a
+    ``parameter_storage`` buffer shaped ``[1, D]`` so its parameters can use the
+    same flattened storage layout as :class:`PackedWideResNet`.
 
     Shape:
         - Input: ``(B, C, H, W)``.
         - Output: ``(B, num_classes)``.
 
     Note:
-        BatchNorm and Linear parameters are direct views into
-        ``parameter_storage``. Conv2d parameters remain regular parameters and
-        are copied to/from storage by the sync methods.
+        All trainable parameters own memory independently from
+        ``parameter_storage``. Use the sync methods to explicitly copy between
+        the model parameters and backing storage.
     """
 
     def __init__(
@@ -248,12 +217,10 @@ class WideResNet(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.feature_channels = channels[-1]
-        self.parameter_storage: Tensor
-        self._parameter_storage_layout: tuple[ParameterStorageEntry, ...]
+        self._parameter_storage: Tensor | None
+        self._parameter_names: tuple[str, ...]
         self._parameter_tensors: list[Tensor]
         self._storage_tensors: list[Tensor]
-        self._non_conv_parameter_tensors: list[Tensor]
-        self._non_conv_storage_tensors: list[Tensor]
 
         self.stem = nn.Conv2d(
             in_channels,
@@ -282,75 +249,67 @@ class WideResNet(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def _make_parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
-        entries: list[ParameterStorageEntry] = []
-        offset = 0
-        for module_name, module in self.named_modules():
-            for parameter_name, parameter in module.named_parameters(recurse=False):
-                name = f"{module_name}.{parameter_name}" if module_name else parameter_name
-                start = _align_offset(offset, _PARAMETER_STORAGE_ALIGNMENT)
-                numel = parameter.numel()
-                padded_numel = _align_offset(numel, _PARAMETER_STORAGE_ALIGNMENT)
-                entries.append(
-                    ParameterStorageEntry(
-                        name=name,
-                        module_name=module_name,
-                        parameter_name=parameter_name,
-                        start=start,
-                        numel=numel,
-                        padded_numel=padded_numel,
-                        shape=tuple(parameter.shape),
-                        is_view=not isinstance(module, nn.Conv2d),
-                    )
-                )
-                offset = start + padded_numel
-        return tuple(entries)
-
     def _init_parameter_storage(self) -> None:
-        self._parameter_storage_layout = self._make_parameter_storage_layout()
-        numel = self.parameter_storage_numel()
-        first_parameter = next(self.parameters())
-        # Zero initialization leaves alignment padding deterministic without
-        # paying to clear padding again during every sync.
-        self.register_buffer(
-            "parameter_storage",
-            torch.zeros(1, numel, device=first_parameter.device, dtype=first_parameter.dtype),
-        )
+        named_parameters = tuple(self.named_parameters())
+        self._parameter_names = tuple(name for name, _ in named_parameters)
+        self._parameter_storage = None
         self._bind_parameter_storage_sync_tensors()
-        self.sync_storage_from_parameters_()
-        self._bind_parameter_storage_views()
-        self._bind_parameter_storage_sync_tensors()
-
-    def _bind_parameter_storage_views(self) -> None:
-        for entry in self._parameter_storage_layout:
-            if not entry.is_view:
-                continue
-            module = _get_submodule(self, entry.module_name)
-            view = self.parameter_storage[0, entry.start : entry.start + entry.numel].view(entry.shape)
-            _set_module_parameter(module, entry.parameter_name, view)
+        self.register_load_state_dict_post_hook(self._clear_parameter_storage_after_load)
 
     def _bind_parameter_storage_sync_tensors(self) -> None:
+        named_parameters = dict(self.named_parameters())
         self._parameter_tensors = []
         self._storage_tensors = []
-        self._non_conv_parameter_tensors = []
-        self._non_conv_storage_tensors = []
-        for entry in self._parameter_storage_layout:
-            module = _get_submodule(self, entry.module_name)
-            parameter = getattr(module, entry.parameter_name)
-            assert isinstance(parameter, Tensor)
-            segment = self.parameter_storage[0, entry.start : entry.start + entry.numel]
-            storage_tensor = segment.view(entry.shape)
-            self._parameter_tensors.append(parameter)
-            self._storage_tensors.append(storage_tensor)
-            if not isinstance(module, nn.Conv2d):
-                self._non_conv_parameter_tensors.append(parameter)
-                self._non_conv_storage_tensors.append(storage_tensor)
+        offset = 0
+        for name in self._parameter_names:
+            parameter = named_parameters[name]
+            numel = parameter.numel()
+            self._parameter_tensors.append(parameter.view(-1))
+            if self._parameter_storage is not None:
+                self._storage_tensors.append(
+                    self._parameter_storage[0, offset : offset + numel]
+                )
+            offset += _align_offset(numel, _PARAMETER_STORAGE_ALIGNMENT)
+
+    def _materialize_parameter_storage(self) -> None:
+        if self._parameter_storage is not None:
+            return
+        first_parameter = next(self.parameters())
+        self._parameter_storage = torch.zeros(
+            1,
+            self.parameter_storage_numel(),
+            device=first_parameter.device,
+            dtype=first_parameter.dtype,
+        )
+        self._bind_parameter_storage_sync_tensors()
+        with torch.no_grad():
+            _foreach_copy_(self._storage_tensors, self._parameter_tensors)
+
+    def _clear_parameter_storage(self) -> None:
+        self._parameter_storage = None
+        self._bind_parameter_storage_sync_tensors()
+
+    def _clear_parameter_storage_after_load(
+        self,
+        module: nn.Module,
+        incompatible_keys: Any,
+    ) -> None:
+        del incompatible_keys
+        assert module is self
+        self._clear_parameter_storage()
 
     def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> Self:
         result = super()._apply(fn, recurse)
-        self._bind_parameter_storage_views()
-        self._bind_parameter_storage_sync_tensors()
+        self._clear_parameter_storage()
         return result
+
+    @property
+    def parameter_storage(self) -> Tensor:
+        """Materialize and return the non-persistent parameter backing storage."""
+
+        self._materialize_parameter_storage()
+        assert self._parameter_storage is not None
+        return self._parameter_storage
 
     def parameter_storage_numel(self) -> int:
         """Return the aligned storage width ``D`` for ``parameter_storage``.
@@ -364,24 +323,10 @@ class WideResNet(nn.Module):
             ``parameter_storage`` has shape ``(1, D)``.
         """
 
-        return max(
-            (entry.start + entry.padded_numel for entry in self._parameter_storage_layout),
-            default=0,
+        return sum(
+            _align_offset(parameter.numel(), _PARAMETER_STORAGE_ALIGNMENT)
+            for parameter in self.parameters()
         )
-
-    def parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
-        """Return immutable metadata for mapping parameters into storage.
-
-        Returns:
-            A tuple of :class:`ParameterStorageEntry` values. Each entry
-            describes one parameter segment in a single storage row.
-
-        Note:
-            Use this layout when writing custom mixing kernels that need stable
-            parameter names, offsets, live lengths, and padded lengths.
-        """
-
-        return self._parameter_storage_layout
 
     def sync_storage_from_parameters_(self) -> Self:
         """Copy current model parameters into ``parameter_storage`` in-place.
@@ -396,32 +341,27 @@ class WideResNet(nn.Module):
             every call.
         """
 
-        with torch.no_grad():
-            _foreach_copy_(self._storage_tensors, self._parameter_tensors)
+        if self._parameter_storage is None:
+            self._materialize_parameter_storage()
+        else:
+            with torch.no_grad():
+                _foreach_copy_(self._storage_tensors, self._parameter_tensors)
         return self
 
-    def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self:
+    def sync_parameters_from_storage_(self) -> Self:
         """Copy ``parameter_storage`` values back into model parameters in-place.
-
-        Args:
-            include_conv: If ``True``, copy all parameter segments, including
-                Conv2d weights. If ``False``, only copy non-Conv2d parameters.
-                Default: ``True``.
 
         Returns:
             ``self``.
 
         Note:
             Call this after directly modifying ``parameter_storage`` and before
-            the next forward pass. Set ``include_conv=False`` only when Conv2d
-            segments were not changed.
+            the next forward pass.
         """
 
+        self._materialize_parameter_storage()
         with torch.no_grad():
-            if include_conv:
-                _foreach_copy_(self._parameter_tensors, self._storage_tensors)
-            else:
-                _foreach_copy_(self._non_conv_parameter_tensors, self._non_conv_storage_tensors)
+            _foreach_copy_(self._parameter_tensors, self._storage_tensors)
         return self
 
     def forward_features(self, input: Tensor) -> Tensor:
@@ -483,7 +423,8 @@ class PackedWideResNet(nn.Module):
         Internally, convolutional features are viewed as ``(B, K * C, H, W)``
         so grouped convolutions and BatchNorm2d can run without permuting axes.
         The ``parameter_storage`` buffer has shape ``(K, D)`` for decentralized
-        parameter mixing.
+        parameter mixing. All trainable parameters own memory independently
+        from this backing storage.
     """
 
     def __init__(
@@ -522,12 +463,10 @@ class PackedWideResNet(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.feature_channels = channels[-1]
-        self.parameter_storage: Tensor
-        self._parameter_storage_layout: tuple[ParameterStorageEntry, ...]
+        self._parameter_storage: Tensor | None
+        self._parameter_names: tuple[str, ...]
         self._parameter_tensors: list[Tensor]
         self._storage_tensors: list[Tensor]
-        self._non_conv_parameter_tensors: list[Tensor]
-        self._non_conv_storage_tensors: list[Tensor]
 
         self.stem = PackedConv2d(
             num_models,
@@ -556,120 +495,79 @@ class PackedWideResNet(nn.Module):
     def _reset_parameters(self) -> None:
         for module in self.modules():
             if isinstance(module, PackedConv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                nn.init.kaiming_normal_(
+                    module.weight[: module.local_out_channels],
+                    mode="fan_out",
+                    nonlinearity="relu",
+                )
                 if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                    nn.init.zeros_(module.bias[: module.local_out_channels])
+                module.broadcast_parameters_()
             elif isinstance(module, PackedBatchNorm2d):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def _make_parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
-        entries: list[ParameterStorageEntry] = []
-        offset = 0
-        for module_name, module in self.named_modules():
-            if isinstance(module, PackedConv2d):
-                candidates = (("weight", module.weight), ("bias", module.bias))
-                is_view = False
-            elif isinstance(module, PackedBatchNorm2d):
-                candidates = (("weight", module.weight), ("bias", module.bias))
-                is_view = False
-            elif isinstance(module, PackedLinear):
-                candidates = (("weight", module.weight), ("bias", module.bias))
-                is_view = True
-            else:
-                continue
-            for parameter_name, parameter in candidates:
-                if parameter is None:
-                    continue
-                name = f"{module_name}.{parameter_name}" if module_name else parameter_name
-                local_numel = parameter.numel() // self.num_models
-                local_shape = tuple(parameter.shape[1:]) if isinstance(module, PackedLinear) else ()
-                if isinstance(module, PackedConv2d):
-                    local_shape = (
-                        module.local_out_channels,
-                        module.local_in_channels,
-                        *module.kernel_size,
-                    )
-                elif isinstance(module, PackedBatchNorm2d):
-                    local_shape = (module.local_num_features,)
-                start = _align_offset(offset, _PARAMETER_STORAGE_ALIGNMENT)
-                padded_numel = _align_offset(local_numel, _PARAMETER_STORAGE_ALIGNMENT)
-                entries.append(
-                    ParameterStorageEntry(
-                        name=name,
-                        module_name=module_name,
-                        parameter_name=parameter_name,
-                        start=start,
-                        numel=local_numel,
-                        padded_numel=padded_numel,
-                        shape=local_shape,
-                        is_view=is_view,
-                    )
-                )
-                offset = start + padded_numel
-        return tuple(entries)
-
     def _init_parameter_storage(self) -> None:
-        self._parameter_storage_layout = self._make_parameter_storage_layout()
-        numel = self.parameter_storage_numel()
-        first_parameter = next(self.parameters())
-        # Each row stores one local model. Alignment padding starts at zero and
-        # remains untouched by normal sync calls.
-        self.register_buffer(
-            "parameter_storage",
-            torch.zeros(
-                self.num_models,
-                numel,
-                device=first_parameter.device,
-                dtype=first_parameter.dtype,
-            ),
-        )
+        named_parameters = tuple(self.named_parameters())
+        self._parameter_names = tuple(name for name, _ in named_parameters)
+        self._parameter_storage = None
         self._bind_parameter_storage_sync_tensors()
-        self.sync_storage_from_parameters_()
-        self._bind_parameter_storage_views()
-        self._bind_parameter_storage_sync_tensors()
-
-    def _bind_parameter_storage_views(self) -> None:
-        for entry in self._parameter_storage_layout:
-            if not entry.is_view:
-                continue
-            module = _get_submodule(self, entry.module_name)
-            view = self.parameter_storage[:, entry.start : entry.start + entry.numel].view(
-                self.num_models,
-                *entry.shape,
-            )
-            _set_module_parameter(module, entry.parameter_name, view)
+        self.register_load_state_dict_post_hook(self._clear_parameter_storage_after_load)
 
     def _bind_parameter_storage_sync_tensors(self) -> None:
+        named_parameters = dict(self.named_parameters())
         self._parameter_tensors = []
         self._storage_tensors = []
-        self._non_conv_parameter_tensors = []
-        self._non_conv_storage_tensors = []
-        for entry in self._parameter_storage_layout:
-            module = _get_submodule(self, entry.module_name)
-            parameter = getattr(module, entry.parameter_name)
-            assert isinstance(parameter, Tensor)
-            segment = self.parameter_storage[:, entry.start : entry.start + entry.numel]
-            if isinstance(module, PackedConv2d):
-                parameter_tensor = parameter.view(self.num_models, *entry.shape)
-                storage_tensor = segment.view(self.num_models, *entry.shape)
-            elif isinstance(module, PackedBatchNorm2d):
-                parameter_tensor = parameter.view(self.num_models, module.local_num_features)
-                storage_tensor = segment.view(self.num_models, module.local_num_features)
-            else:
-                parameter_tensor = parameter
-                storage_tensor = segment.view(self.num_models, *entry.shape)
-            self._parameter_tensors.append(parameter_tensor)
-            self._storage_tensors.append(storage_tensor)
-            if not isinstance(module, PackedConv2d):
-                self._non_conv_parameter_tensors.append(parameter_tensor)
-                self._non_conv_storage_tensors.append(storage_tensor)
+        offset = 0
+        for name in self._parameter_names:
+            parameter = named_parameters[name]
+            local_numel = parameter.numel() // self.num_models
+            self._parameter_tensors.append(parameter.view(self.num_models, local_numel))
+            if self._parameter_storage is not None:
+                self._storage_tensors.append(
+                    self._parameter_storage[:, offset : offset + local_numel]
+                )
+            offset += _align_offset(local_numel, _PARAMETER_STORAGE_ALIGNMENT)
+
+    def _materialize_parameter_storage(self) -> None:
+        if self._parameter_storage is not None:
+            return
+        first_parameter = next(self.parameters())
+        self._parameter_storage = torch.zeros(
+            self.num_models,
+            self.parameter_storage_numel(),
+            device=first_parameter.device,
+            dtype=first_parameter.dtype,
+        )
+        self._bind_parameter_storage_sync_tensors()
+        with torch.no_grad():
+            _foreach_copy_(self._storage_tensors, self._parameter_tensors)
+
+    def _clear_parameter_storage(self) -> None:
+        self._parameter_storage = None
+        self._bind_parameter_storage_sync_tensors()
+
+    def _clear_parameter_storage_after_load(
+        self,
+        module: nn.Module,
+        incompatible_keys: Any,
+    ) -> None:
+        del incompatible_keys
+        assert module is self
+        self._clear_parameter_storage()
 
     def _apply(self, fn: Callable[[Tensor], Tensor], recurse: bool = True) -> Self:
         result = super()._apply(fn, recurse)
-        self._bind_parameter_storage_views()
-        self._bind_parameter_storage_sync_tensors()
+        self._clear_parameter_storage()
         return result
+
+    @property
+    def parameter_storage(self) -> Tensor:
+        """Materialize and return the non-persistent parameter backing storage."""
+
+        self._materialize_parameter_storage()
+        assert self._parameter_storage is not None
+        return self._parameter_storage
 
     def parameter_storage_numel(self) -> int:
         """Return the aligned per-model storage width ``D``.
@@ -683,25 +581,13 @@ class PackedWideResNet(nn.Module):
             ``parameter_storage`` has shape ``(K, D)``.
         """
 
-        return max(
-            (entry.start + entry.padded_numel for entry in self._parameter_storage_layout),
-            default=0,
+        return sum(
+            _align_offset(
+                parameter.numel() // self.num_models,
+                _PARAMETER_STORAGE_ALIGNMENT,
+            )
+            for parameter in self.parameters()
         )
-
-    def parameter_storage_layout(self) -> tuple[ParameterStorageEntry, ...]:
-        """Return immutable metadata for each per-model storage segment.
-
-        Returns:
-            A tuple of :class:`ParameterStorageEntry` values. Each entry
-            describes one per-model parameter segment.
-
-        Note:
-            Each entry maps ``parameter_storage[:, start:start + numel]`` to a
-            parameter for all ``K`` local models. ``padded_numel`` describes the
-            reserved aligned span for that parameter.
-        """
-
-        return self._parameter_storage_layout
 
     def sync_storage_from_parameters_(self) -> Self:
         """Copy packed model parameters into ``parameter_storage`` in-place.
@@ -716,32 +602,27 @@ class PackedWideResNet(nn.Module):
             ``parameter_storage.copy_(mixing @ parameter_storage)``.
         """
 
-        with torch.no_grad():
-            _foreach_copy_(self._storage_tensors, self._parameter_tensors)
+        if self._parameter_storage is None:
+            self._materialize_parameter_storage()
+        else:
+            with torch.no_grad():
+                _foreach_copy_(self._storage_tensors, self._parameter_tensors)
         return self
 
-    def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self:
+    def sync_parameters_from_storage_(self) -> Self:
         """Copy ``parameter_storage`` values back into packed parameters.
-
-        Args:
-            include_conv: If ``True``, copy all parameter segments, including
-                grouped convolution weights. If ``False``, only copy non-Conv2d
-                parameters. Default: ``True``.
 
         Returns:
             ``self``.
 
         Note:
             Call this after modifying ``parameter_storage`` and before the next
-            forward pass. Set ``include_conv=False`` only when Conv2d segments
-            were not changed.
+            forward pass.
         """
 
+        self._materialize_parameter_storage()
         with torch.no_grad():
-            if include_conv:
-                _foreach_copy_(self._parameter_tensors, self._storage_tensors)
-            else:
-                _foreach_copy_(self._non_conv_parameter_tensors, self._non_conv_storage_tensors)
+            _foreach_copy_(self._parameter_tensors, self._storage_tensors)
         return self
 
     def average(self, model: WideResNet | None = None) -> WideResNet:

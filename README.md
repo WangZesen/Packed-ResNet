@@ -18,18 +18,49 @@ Inputs use `[B, K, C, H, W]`, where `K` is fixed when the model is created.
 Convolutional activations are viewed internally as `[B, K * C, H, W]`.
 Convolutions use `groups=K`, BatchNorm uses `BatchNorm2d(K * C)`, and the final
 classifier is packed with one independent weight matrix per local model.
+Packed models initialize model 0 once and broadcast its parameters to every
+other local model, so all local models start from identical parameters.
+
+## MLP Models
+
+`MLP` provides a standard single-model MLP, while `PackedMLP` applies
+independent MLPs to inputs shaped `[B, K, F]`:
+
+```python
+from packed_resnet import MLP, PackedMLP
+
+single_mlp = MLP(
+    in_features=128,
+    hidden_features=(256, 256),
+    out_features=10,
+)
+
+mlp = PackedMLP(
+    num_models=4,
+    in_features=128,
+    hidden_features=(256, 256),
+    out_features=10,
+)
+logits = mlp(torch.randn(8, 4, 128))
+assert logits.shape == (8, 4, 10)
+```
+
+Activations are applied after hidden layers only. Pass `hidden_features=()` for
+a single packed linear projection.
 
 ## Parameter Storage and Mixing
 
-Both `PackedWideResNet` and `WideResNet` maintain a contiguous
+Both `PackedWideResNet` and `WideResNet` provide a contiguous
 `parameter_storage` tensor for decentralized parameter mixing:
 
 - packed models use `[K, D]`
 - normal models use `[1, D]`
 - each parameter segment is padded to a 64-element boundary
 - BatchNorm running statistics are not included
+- storage is materialized lazily and is excluded from `state_dict()` and
+  `torch.export`
 
-Training still uses the layer parameters returned by `model.parameters()`.
+All trainable parameters own memory independently from `parameter_storage`.
 Synchronize explicitly around mixing:
 
 ```python
@@ -41,9 +72,8 @@ with torch.no_grad():
 packed.sync_parameters_from_storage_()
 ```
 
-`PackedLinear` parameters share storage with `parameter_storage`. Conv2d
-parameters are copied to and from storage so grouped convolution remains fast.
-The same sync APIs are available on `WideResNet`.
+Both sync directions copy every trainable parameter using cached tensor views
+and `torch._foreach_copy_`. The same sync APIs are available on `WideResNet`.
 
 To create a standard WideResNet whose parameters are the global average of the
 packed local models:
