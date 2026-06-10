@@ -23,6 +23,53 @@ packed with one independent weight matrix per local model.
 Packed models initialize model 0 once and broadcast its parameters to every
 other local model, so all local models start from identical parameters.
 
+## Packed Distributed Dataloaders
+
+`create_dataloader` downloads MNIST, CIFAR10, or CIFAR100 and keeps the complete
+split as `float32` tensors on CUDA when available. Each epoch exactly reproduces
+PyTorch `DistributedSampler` sharding for the selected simulated ranks:
+
+```python
+from packed_resnet import create_dataloader
+
+loader = create_dataloader(
+    "cifar10",
+    root="./data",
+    batch_size=64,       # Per-rank batch size.
+    world_size=16,
+    ranks=[2, 5, 9, 12],
+    base_seed=0,
+)
+
+for epoch in range(10):
+    loader.set_epoch(epoch)
+    for images, targets in loader:
+        # images: channels-last [64, 4 * 3, 32, 32]
+        # targets: [64, 4]
+        ...
+```
+
+Training loaders shuffle and apply deterministic per-rank CIFAR random crops
+and horizontal flips by default. Test loaders disable both. Standard dataset
+normalization is enabled by default.
+
+Pass `packed=False` for compatibility with a normal single-worker model. This
+mode requires exactly one rank and returns images shaped `[B, C, H, W]` with
+targets shaped `[B]`.
+
+Benchmark complete dataloader epochs for a world size and number of packed
+ranks with:
+
+```bash
+uv run python tests/benchmark_dataloader.py --world-size 32 --num-ranks 8
+uv run python tests/benchmark_dataloader.py --dataset cifar100 --world-size 64 --num-ranks 16 --batch-size 128
+uv run python tests/benchmark_dataloader.py --world-size 32 --num-ranks 8 --device cpu --no-augment
+```
+
+Dataset download and initial GPU materialization happen before timing. The
+reported epoch time includes deterministic sampling, indexing, augmentation,
+normalization, packing, and synchronization of all resulting GPU work.
+
 ## MLP Models
 
 `MLP` provides a standard single-model MLP, while `PackedMLP` applies
