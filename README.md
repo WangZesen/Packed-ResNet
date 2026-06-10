@@ -9,15 +9,17 @@ from packed_resnet import packed_wrn_28_10, wrn_28_10
 
 single_model = wrn_28_10(num_classes=10)
 model = packed_wrn_28_10(num_models=4, num_classes=10)
-x = torch.randn(8, 4, 3, 32, 32)
+x = torch.randn(8, 4 * 3, 32, 32).contiguous(memory_format=torch.channels_last)
 logits = model(x)
 assert logits.shape == (8, 4, 10)
 ```
 
-Inputs use `[B, K, C, H, W]`, where `K` is fixed when the model is created.
-Convolutional activations are viewed internally as `[B, K * C, H, W]`.
-Convolutions use `groups=K`, BatchNorm uses `BatchNorm2d(K * C)`, and the final
-classifier is packed with one independent weight matrix per local model.
+Wide ResNet inputs use channels-last contiguous `[B, C, H, W]` tensors. Packed
+Wide ResNet inputs use channels-last contiguous `[B, K * C, H, W]` tensors,
+where each contiguous group of `C` channels belongs to one local model and `K`
+is fixed when the model is created. Convolutions use channels-last weights and
+`groups=K`, BatchNorm uses `BatchNorm2d(K * C)`, and the final classifier is
+packed with one independent weight matrix per local model.
 Packed models initialize model 0 once and broadcast its parameters to every
 other local model, so all local models start from identical parameters.
 
@@ -72,8 +74,10 @@ with torch.no_grad():
 packed.sync_parameters_from_storage_()
 ```
 
-Both sync directions copy every trainable parameter using cached tensor views
-and `torch._foreach_copy_`. The same sync APIs are available on `WideResNet`.
+Both sync directions copy every trainable parameter using cached physical-layout
+tensor views and `torch._foreach_copy_`. Channels-last convolution weights are
+copied directly without first materializing contiguous-format copies. The same
+sync APIs are available on `WideResNet`.
 
 To create a standard WideResNet whose parameters are the global average of the
 packed local models:
@@ -101,6 +105,7 @@ uv run python tests/benchmark_gpu_timing.py --model wrn28-10
 uv run python tests/benchmark_gpu_timing.py --model all
 uv run python tests/benchmark_gpu_timing.py --amp bf16
 uv run python tests/benchmark_gpu_timing.py --amp bf16 --compile
+uv run python tests/benchmark_gpu_timing.py --include-optimizer-step
 uv run python tests/benchmark_gpu_timing.py --include-storage-sync
 uv run python tests/benchmark_gpu_timing.py --compile --batch-sizes 16 --num-models 8
 ```

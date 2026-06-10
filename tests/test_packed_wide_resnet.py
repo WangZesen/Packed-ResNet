@@ -23,9 +23,28 @@ def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
 
 
+def _channels_last_input(batch_size: int, channels: int) -> torch.Tensor:
+    return torch.randn(batch_size, channels, 32, 32).contiguous(
+        memory_format=torch.channels_last
+    )
+
+
+def _packed_input(batch_size: int, num_models: int, channels: int = 3) -> torch.Tensor:
+    return _channels_last_input(batch_size, num_models * channels)
+
+
 def _assert_local_parameters_identical(model: PackedWideResNet) -> None:
     for parameter in model.parameters():
-        local_parameters = parameter.view(model.num_models, -1)
+        local_numel = parameter.numel() // model.num_models
+        if parameter.is_contiguous():
+            local_parameters = parameter.view(model.num_models, local_numel)
+        else:
+            assert parameter.ndim == 4
+            assert parameter.is_contiguous(memory_format=torch.channels_last)
+            local_parameters = parameter.as_strided(
+                (model.num_models, local_numel),
+                (local_numel, 1),
+            )
         torch.testing.assert_close(
             local_parameters,
             local_parameters[0].unsqueeze(0).expand_as(local_parameters),
@@ -36,7 +55,7 @@ def _assert_local_parameters_identical(model: PackedWideResNet) -> None:
 
 def test_forward_shape() -> None:
     model = PackedWideResNet(depth=10, widen_factor=1, num_models=3, num_classes=7)
-    x = torch.randn(2, 3, 3, 32, 32)
+    x = _packed_input(2, 3)
 
     logits = model(x)
 
@@ -51,7 +70,7 @@ def test_packed_wide_resnet_initializes_all_local_models_identically() -> None:
 
 def test_wide_resnet_forward_shape() -> None:
     model = WideResNet(depth=10, widen_factor=1, num_classes=7)
-    x = torch.randn(2, 3, 32, 32)
+    x = _channels_last_input(2, 3)
 
     logits = model(x)
 
@@ -112,7 +131,7 @@ def test_parameter_storage_is_excluded_from_torch_export() -> None:
     model = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=5).eval()
     model.parameter_storage
 
-    exported = torch.export.export(model, (torch.randn(1, 2, 3, 32, 32),))
+    exported = torch.export.export(model, (_packed_input(1, 2),))
 
     assert all("parameter_storage" not in name for name in exported.state_dict)
     assert all("parameter_storage" not in name for name in exported.constants)
@@ -193,6 +212,28 @@ def test_uses_grouped_convolutions_and_packed_batch_norm() -> None:
     assert all(conv.groups == 3 for conv in convs)
     assert norms
     assert all(norm.num_features == 3 * norm.local_num_features for norm in norms)
+    assert all(conv.weight.is_contiguous(memory_format=torch.channels_last) for conv in convs)
+
+
+def test_channels_last_weights_have_contiguous_zero_copy_storage_sync_views() -> None:
+    models = [
+        PackedWideResNet(depth=10, widen_factor=1, num_models=3),
+        WideResNet(depth=10, widen_factor=1),
+    ]
+
+    for model in models:
+        model.parameter_storage
+        named_parameters = dict(model.named_parameters())
+        for name, parameter_tensor in zip(
+            model._parameter_names,
+            model._parameter_tensors,
+            strict=True,
+        ):
+            parameter = named_parameters[name]
+            if parameter.ndim == 4:
+                assert parameter.is_contiguous(memory_format=torch.channels_last)
+            assert parameter_tensor.is_contiguous()
+            assert _storage_ptr(parameter_tensor) == _storage_ptr(parameter)
 
 
 def test_packed_model_matches_separate_single_model_forwards() -> None:
@@ -207,10 +248,13 @@ def test_packed_model_matches_separate_single_model_forwards() -> None:
     for model in models:
         model.eval()
 
-    x = torch.randn(4, 3, 3, 32, 32)
+    x = _packed_input(4, 3)
     packed_logits = packed(x)
     separate_logits = torch.cat(
-        [model(x[:, idx : idx + 1]) for idx, model in enumerate(models)],
+        [
+            model(x[:, idx * 3 : (idx + 1) * 3].contiguous(memory_format=torch.channels_last))
+            for idx, model in enumerate(models)
+        ],
         dim=1,
     )
 
@@ -226,10 +270,13 @@ def test_packed_model_matches_normal_wide_resnet_forwards() -> None:
     for model in models:
         model.eval()
 
-    x = torch.randn(4, 3, 3, 32, 32)
+    x = _packed_input(4, 3)
     packed_logits = packed(x)
     separate_logits = torch.stack(
-        [model(x[:, idx]) for idx, model in enumerate(models)],
+        [
+            model(x[:, idx * 3 : (idx + 1) * 3].contiguous(memory_format=torch.channels_last))
+            for idx, model in enumerate(models)
+        ],
         dim=1,
     )
 
@@ -251,7 +298,7 @@ def test_parameter_storage_mixing_changes_outputs_after_sync() -> None:
     torch.manual_seed(0)
     model = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=4)
     model.eval()
-    x = torch.randn(2, 2, 3, 32, 32)
+    x = _packed_input(2, 2)
     before = model(x)
 
     with torch.no_grad():
@@ -294,7 +341,7 @@ def test_average_rejects_mismatched_target() -> None:
 def test_gradient_isolation_between_local_models() -> None:
     torch.manual_seed(0)
     model = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=4)
-    x = torch.randn(2, 2, 3, 32, 32)
+    x = _packed_input(2, 2)
 
     loss = model(x)[:, 0].sum()
     loss.backward()
@@ -344,18 +391,20 @@ def test_packed_linear_matches_independent_linear_layers(bias: bool) -> None:
 def test_invalid_shapes_raise_clear_errors() -> None:
     model = PackedWideResNet(depth=10, widen_factor=1, num_models=2)
 
-    with pytest.raises(ValueError, match=r"expects \[B, K, C, H, W\]"):
-        model(torch.randn(2, 3, 32, 32))
-    with pytest.raises(ValueError, match="expected K=2"):
-        model(torch.randn(2, 3, 3, 32, 32))
-    with pytest.raises(ValueError, match="expected C=3"):
-        model(torch.randn(2, 2, 1, 32, 32))
+    with pytest.raises(ValueError, match=r"expects \[B, K\*C, H, W\]"):
+        model(torch.randn(2, 2, 3, 32, 32))
+    with pytest.raises(ValueError, match=r"expected K\*C=6"):
+        model(_channels_last_input(2, 3))
+    with pytest.raises(ValueError, match="channels-last"):
+        model(torch.randn(2, 6, 32, 32))
 
     normal = WideResNet(depth=10, widen_factor=1)
     with pytest.raises(ValueError, match=r"expects \[B, C, H, W\]"):
         normal(torch.randn(2, 1, 3, 32, 32))
     with pytest.raises(ValueError, match="expected C=3"):
-        normal(torch.randn(2, 1, 32, 32))
+        normal(_channels_last_input(2, 1))
+    with pytest.raises(ValueError, match="channels-last"):
+        normal(torch.randn(2, 3, 32, 32))
 
 
 def test_depth_validation() -> None:

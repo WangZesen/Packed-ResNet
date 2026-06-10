@@ -40,6 +40,17 @@ def _foreach_copy_(destinations: list[Tensor], sources: list[Tensor]) -> None:
         torch._foreach_copy_(destinations, sources)
 
 
+def _flatten_parameter_by_model(parameter: Tensor, num_models: int) -> Tensor:
+    local_numel = parameter.numel() // num_models
+    if parameter.is_contiguous():
+        return parameter.view(num_models, local_numel)
+    if parameter.ndim == 4 and parameter.is_contiguous(memory_format=torch.channels_last):
+        return parameter.as_strided((num_models, local_numel), (local_numel, 1))
+    raise ValueError(
+        f"parameter shape {tuple(parameter.shape)} must be contiguous or channels-last contiguous"
+    )
+
+
 class MLP(nn.Module):
     """Standard single-model multi-layer perceptron.
 
@@ -217,10 +228,10 @@ class WideResNet(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.feature_channels = channels[-1]
-        self._parameter_storage: Tensor | None
-        self._parameter_names: tuple[str, ...]
-        self._parameter_tensors: list[Tensor]
-        self._storage_tensors: list[Tensor]
+        self._parameter_storage: Tensor | None = None
+        self._parameter_names: tuple[str, ...] = ()
+        self._parameter_tensors: list[Tensor] = []
+        self._storage_tensors: list[Tensor] = []
 
         self.stem = nn.Conv2d(
             in_channels,
@@ -237,6 +248,7 @@ class WideResNet(nn.Module):
         self.classifier = nn.Linear(channels[3], num_classes)
 
         self._reset_parameters()
+        self.to(memory_format=torch.channels_last)
         self._init_parameter_storage()
 
     def _reset_parameters(self) -> None:
@@ -264,7 +276,7 @@ class WideResNet(nn.Module):
         for name in self._parameter_names:
             parameter = named_parameters[name]
             numel = parameter.numel()
-            self._parameter_tensors.append(parameter.view(-1))
+            self._parameter_tensors.append(_flatten_parameter_by_model(parameter, 1)[0])
             if self._parameter_storage is not None:
                 self._storage_tensors.append(
                     self._parameter_storage[0, offset : offset + numel]
@@ -383,6 +395,8 @@ class WideResNet(nn.Module):
             raise ValueError(f"WideResNet expects [B, C, H, W], got {tuple(input.shape)}")
         if input.shape[1] != self.in_channels:
             raise ValueError(f"expected C={self.in_channels}, got C={input.shape[1]}")
+        if not input.is_contiguous(memory_format=torch.channels_last):
+            raise ValueError("WideResNet input must be contiguous in channels-last format")
         out = self.stem(input)
         out = self.stage1(out)
         out = self.stage2(out)
@@ -416,12 +430,12 @@ class PackedWideResNet(nn.Module):
     ``K * channels``.
 
     Shape:
-        - Input: ``(B, K, C, H, W)``.
+        - Input: channels-last contiguous ``(B, K * C, H, W)``.
         - Output: ``(B, K, num_classes)``.
 
     Note:
-        Internally, convolutional features are viewed as ``(B, K * C, H, W)``
-        so grouped convolutions and BatchNorm2d can run without permuting axes.
+        Inputs and convolution weights use channels-last memory format. Packed
+        input channels are ordered as contiguous ``K`` groups of ``C`` channels.
         The ``parameter_storage`` buffer has shape ``(K, D)`` for decentralized
         parameter mixing. All trainable parameters own memory independently
         from this backing storage.
@@ -463,10 +477,10 @@ class PackedWideResNet(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.feature_channels = channels[-1]
-        self._parameter_storage: Tensor | None
-        self._parameter_names: tuple[str, ...]
-        self._parameter_tensors: list[Tensor]
-        self._storage_tensors: list[Tensor]
+        self._parameter_storage: Tensor | None = None
+        self._parameter_names: tuple[str, ...] = ()
+        self._parameter_tensors: list[Tensor] = []
+        self._storage_tensors: list[Tensor] = []
 
         self.stem = PackedConv2d(
             num_models,
@@ -490,6 +504,7 @@ class PackedWideResNet(nn.Module):
         self.classifier = PackedLinear(num_models, channels[3], num_classes)
 
         self._reset_parameters()
+        self.to(memory_format=torch.channels_last)
         self._init_parameter_storage()
 
     def _reset_parameters(self) -> None:
@@ -522,7 +537,9 @@ class PackedWideResNet(nn.Module):
         for name in self._parameter_names:
             parameter = named_parameters[name]
             local_numel = parameter.numel() // self.num_models
-            self._parameter_tensors.append(parameter.view(self.num_models, local_numel))
+            self._parameter_tensors.append(
+                _flatten_parameter_by_model(parameter, self.num_models)
+            )
             if self._parameter_storage is not None:
                 self._storage_tensors.append(
                     self._parameter_storage[:, offset : offset + local_numel]
@@ -665,24 +682,23 @@ class PackedWideResNet(nn.Module):
         model.sync_parameters_from_storage_()
         return model
 
-    def _pack_input(self, input: Tensor) -> Tensor:
-        if input.ndim != 5:
-            raise ValueError(f"PackedWideResNet expects [B, K, C, H, W], got {tuple(input.shape)}")
-        batch, num_models, channels, height, width = input.shape
-        if num_models != self.num_models:
-            raise ValueError(f"expected K={self.num_models}, got K={num_models}")
-        if channels != self.in_channels:
-            raise ValueError(f"expected C={self.in_channels}, got C={channels}")
-        return input.reshape(batch, num_models * channels, height, width)
+    def _validate_input(self, input: Tensor) -> None:
+        if input.ndim != 4:
+            raise ValueError(f"PackedWideResNet expects [B, K*C, H, W], got {tuple(input.shape)}")
+        expected_channels = self.num_models * self.in_channels
+        if input.shape[1] != expected_channels:
+            raise ValueError(f"expected K*C={expected_channels}, got K*C={input.shape[1]}")
+        if not input.is_contiguous(memory_format=torch.channels_last):
+            raise ValueError("PackedWideResNet input must be contiguous in channels-last format")
 
     def forward_features(self, input: Tensor) -> Tensor:
         """Return packed spatial features before pooling and classification.
 
         Args:
-            input: Packed image tensor where ``K`` equals ``num_models``.
+            input: Channels-last packed image tensor.
 
         Shape:
-            - Input: ``(B, K, C, H, W)``.
+            - Input: ``(B, K * C, H, W)``.
             - Output: ``(B, K * feature_channels, H / 4, W / 4)`` for the
               default CIFAR strides.
 
@@ -691,7 +707,8 @@ class PackedWideResNet(nn.Module):
             pooling.
         """
 
-        out = self._pack_input(input)
+        self._validate_input(input)
+        out = input
         out = self.stem(out)
         out = self.stage1(out)
         out = self.stage2(out)
@@ -703,10 +720,10 @@ class PackedWideResNet(nn.Module):
         """Return packed classification logits.
 
         Args:
-            input: Packed image tensor where ``K`` equals ``num_models``.
+            input: Channels-last packed image tensor.
 
         Shape:
-            - Input: ``(B, K, C, H, W)``.
+            - Input: ``(B, K * C, H, W)``.
             - Output: ``(B, K, num_classes)``.
 
         Returns:
