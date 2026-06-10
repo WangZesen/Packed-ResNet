@@ -14,6 +14,7 @@ from .layers import (
     PackedConv2d,
     PackedLinear,
     PackedNetworkBlock,
+    _batch_norm_relu,
 )
 
 _PARAMETER_STORAGE_ALIGNMENT = 64
@@ -401,7 +402,7 @@ class WideResNet(nn.Module):
         out = self.stage1(out)
         out = self.stage2(out)
         out = self.stage3(out)
-        return F.relu(self.bn(out), inplace=False)
+        return _batch_norm_relu(out, self.bn)
 
     def forward(self, input: Tensor) -> Tensor:
         """Return classification logits.
@@ -713,7 +714,7 @@ class PackedWideResNet(nn.Module):
         out = self.stage1(out)
         out = self.stage2(out)
         out = self.stage3(out)
-        out = F.relu(self.bn(out), inplace=False)
+        out = _batch_norm_relu(out, self.bn)
         return out
 
     def forward(self, input: Tensor) -> Tensor:

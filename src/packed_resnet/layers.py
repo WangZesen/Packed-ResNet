@@ -4,7 +4,35 @@ import math
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
+
+from .triton_ops import triton_batch_norm_relu
+
+
+def _batch_norm_relu(input: Tensor, batch_norm: nn.BatchNorm2d) -> Tensor:
+    if not input.is_cuda:
+        raise ValueError("Triton BatchNorm + ReLU requires a CUDA input")
+    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"Triton BatchNorm + ReLU does not support dtype {input.dtype}")
+    if not input.is_contiguous(memory_format=torch.channels_last):
+        raise ValueError("Triton BatchNorm + ReLU requires channels-last contiguous input")
+    if not batch_norm.affine or not batch_norm.track_running_stats or batch_norm.momentum is None:
+        raise ValueError("Triton BatchNorm + ReLU requires affine BatchNorm with tracked running statistics")
+    assert batch_norm.weight is not None
+    assert batch_norm.bias is not None
+    assert batch_norm.running_mean is not None
+    assert batch_norm.running_var is not None
+    assert batch_norm.num_batches_tracked is not None
+    return triton_batch_norm_relu(
+        input,
+        batch_norm.weight,
+        batch_norm.bias,
+        batch_norm.running_mean,
+        batch_norm.running_var,
+        batch_norm.num_batches_tracked,
+        training=batch_norm.training,
+        momentum=batch_norm.momentum,
+        eps=batch_norm.eps,
+    )
 
 
 class PackedConv2d(nn.Conv2d):
@@ -176,8 +204,8 @@ class PackedBasicBlock(nn.Module):
             self.shortcut = None
 
     def forward(self, input: Tensor) -> Tensor:
-        out = self.conv1(F.relu(self.bn1(input), inplace=False))
-        out = self.conv2(F.relu(self.bn2(out), inplace=False))
+        out = self.conv1(_batch_norm_relu(input, self.bn1))
+        out = self.conv2(_batch_norm_relu(out, self.bn2))
         residual = input if self.shortcut is None else self.shortcut(input)
         return out + residual
 
@@ -247,8 +275,8 @@ class BasicBlock(nn.Module):
             self.shortcut = None
 
     def forward(self, input: Tensor) -> Tensor:
-        out = self.conv1(F.relu(self.bn1(input), inplace=False))
-        out = self.conv2(F.relu(self.bn2(out), inplace=False))
+        out = self.conv1(_batch_norm_relu(input, self.bn1))
+        out = self.conv2(_batch_norm_relu(out, self.bn2))
         residual = input if self.shortcut is None else self.shortcut(input)
         return out + residual
 
