@@ -57,8 +57,8 @@ class PackedDataLoader:
             raise ValueError(f"all ranks must be in [0, {world_size})")
         if not packed and len(ranks) != 1:
             raise ValueError("unpacked mode requires exactly one rank")
-        if augment and images.shape[-2:] != (32, 32):
-            raise ValueError("built-in augmentation is supported only for 32x32 CIFAR images")
+        if augment and tuple(images.shape[1:]) not in ((1, 28, 28), (3, 32, 32)):
+            raise ValueError("built-in augmentation supports only MNIST [N, 1, 28, 28] and CIFAR [N, 3, 32, 32]")
         if normalize and (mean is None or std is None):
             raise ValueError("mean and std are required when normalize=True")
         if mean is not None and len(mean) != images.shape[1]:
@@ -77,6 +77,7 @@ class PackedDataLoader:
         self.packed = packed
         self.shuffle = shuffle
         self.augment = augment
+        self._horizontal_flip = images.shape[1:] == (3, 32, 32)
         self.normalize = normalize
         self.sampler_drop_last = sampler_drop_last
         self.drop_last = drop_last
@@ -140,7 +141,10 @@ class PackedDataLoader:
             generator = torch.Generator(device=self.device)
             generator.manual_seed(self.base_seed + self.epoch * 1_000_003 + rank * 10_000_019)
             offsets.append(torch.randint(0, 9, (self.num_samples, 2), device=self.device, generator=generator))
-            flips.append(torch.rand(self.num_samples, device=self.device, generator=generator) < 0.5)
+            if self._horizontal_flip:
+                flips.append(torch.rand(self.num_samples, device=self.device, generator=generator) < 0.5)
+            else:
+                flips.append(torch.zeros(self.num_samples, device=self.device, dtype=torch.bool))
         return torch.stack(offsets, dim=1), torch.stack(flips, dim=1)
 
     def _augment_batch(self, images: Tensor, offsets: Tensor, flip: Tensor) -> Tensor:
@@ -149,7 +153,8 @@ class PackedDataLoader:
         rows = offsets[:, 0, None] + torch.arange(height, device=self.device)[None, :]
         cropped = padded.gather(2, rows[:, None, :, None].expand(-1, images.shape[1], -1, padded.shape[3]))
         column_order = torch.arange(width, device=self.device).expand(batch_size, -1)
-        column_order = torch.where(flip[:, None], width - 1 - column_order, column_order)
+        if self._horizontal_flip:
+            column_order = torch.where(flip[:, None], width - 1 - column_order, column_order)
         columns = offsets[:, 1, None] + column_order
         return cropped.gather(3, columns[:, None, None, :].expand(-1, images.shape[1], height, -1))
 

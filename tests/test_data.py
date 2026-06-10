@@ -205,6 +205,33 @@ def test_augmentation_is_independent_of_batch_size() -> None:
     assert all(batch.is_contiguous(memory_format=torch.channels_last) for batch in large_images)
 
 
+def test_mnist_augmentation_applies_random_crop_without_horizontal_flip() -> None:
+    images = torch.arange(8 * 28 * 28, dtype=torch.float32).reshape(8, 1, 28, 28)
+    loader = PackedDataLoader(
+        images,
+        torch.arange(8),
+        batch_size=4,
+        world_size=1,
+        ranks=[0],
+        base_seed=7,
+        packed=False,
+        shuffle=False,
+        augment=True,
+        normalize=False,
+    )
+
+    offsets, flips = loader._augmentation_parameters() or (None, None)
+    first_images, _ = next(iter(loader))
+    repeated_images, _ = next(iter(loader))
+
+    assert offsets is not None and flips is not None
+    assert torch.count_nonzero(flips) == 0
+    assert first_images.shape == (4, 1, 28, 28)
+    assert first_images.is_contiguous(memory_format=torch.channels_last)
+    assert not torch.equal(first_images, images[:4])
+    torch.testing.assert_close(first_images, repeated_images)
+
+
 @pytest.mark.parametrize(
     ("dataset_name", "shape", "channels", "default_augment"),
     [

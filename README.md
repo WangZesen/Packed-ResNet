@@ -50,8 +50,10 @@ for epoch in range(10):
 ```
 
 Training loaders shuffle and apply deterministic per-rank CIFAR random crops
-and horizontal flips by default. Test loaders disable both. Standard dataset
-normalization is enabled by default.
+and horizontal flips by default. MNIST augmentation is disabled by default;
+passing `augment=True` applies deterministic random crops without horizontal
+flips. Test loaders disable augmentation. Standard dataset normalization is
+enabled by default.
 
 Pass `packed=False` for compatibility with a normal single-worker model. This
 mode requires exactly one rank and returns images shaped `[B, C, H, W]` with
