@@ -237,9 +237,10 @@ class PackedBasicBlock(nn.Module):
             self.shortcut = None
 
     def forward(self, input: Tensor) -> Tensor:
-        out = self.conv1(F.relu(self.bn1(input), inplace=False))
+        preactivated = F.relu(self.bn1(input), inplace=False)
+        out = self.conv1(preactivated)
         out = self.conv2(F.relu(self.bn2(out), inplace=False))
-        residual = input if self.shortcut is None else self.shortcut(input)
+        residual = input if self.shortcut is None else self.shortcut(preactivated)
         return out + residual
 
 
@@ -308,9 +309,10 @@ class BasicBlock(nn.Module):
             self.shortcut = None
 
     def forward(self, input: Tensor) -> Tensor:
-        out = self.conv1(F.relu(self.bn1(input), inplace=False))
+        preactivated = F.relu(self.bn1(input), inplace=False)
+        out = self.conv1(preactivated)
         out = self.conv2(F.relu(self.bn2(out), inplace=False))
-        residual = input if self.shortcut is None else self.shortcut(input)
+        residual = input if self.shortcut is None else self.shortcut(preactivated)
         return out + residual
 
 

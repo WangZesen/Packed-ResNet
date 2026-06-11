@@ -13,6 +13,7 @@ from packed_resnet import (
     packed_wrn_28_10,
     wrn_28_10,
 )
+from packed_resnet.layers import BasicBlock, PackedBasicBlock
 
 
 def _num_parameters(model: torch.nn.Module) -> int:
@@ -51,6 +52,60 @@ def _assert_local_parameters_identical(model: PackedWideResNet) -> None:
             rtol=0,
             atol=0,
         )
+
+
+@pytest.mark.parametrize(
+    ("block", "input"),
+    [
+        (BasicBlock(in_channels=2, out_channels=4, stride=2), torch.randn(2, 2, 8, 8)),
+        (
+            PackedBasicBlock(num_models=3, in_channels=2, out_channels=4, stride=2),
+            torch.randn(2, 3 * 2, 8, 8),
+        ),
+    ],
+)
+def test_projection_shortcut_uses_preactivated_input(
+    block: BasicBlock | PackedBasicBlock,
+    input: torch.Tensor,
+) -> None:
+    block.eval()
+    assert block.shortcut is not None
+
+    with torch.no_grad():
+        block.conv1.weight.zero_()
+        block.conv2.weight.zero_()
+        preactivated = torch.relu(block.bn1(input))
+        expected = block.shortcut(preactivated)
+        raw_shortcut = block.shortcut(input)
+
+    output = block(input)
+
+    torch.testing.assert_close(output, expected)
+    assert not torch.allclose(output, raw_shortcut)
+
+
+@pytest.mark.parametrize(
+    ("block", "input"),
+    [
+        (BasicBlock(in_channels=2, out_channels=2, stride=1), torch.randn(2, 2, 8, 8)),
+        (
+            PackedBasicBlock(num_models=3, in_channels=2, out_channels=2, stride=1),
+            torch.randn(2, 3 * 2, 8, 8),
+        ),
+    ],
+)
+def test_identity_shortcut_uses_raw_input(
+    block: BasicBlock | PackedBasicBlock,
+    input: torch.Tensor,
+) -> None:
+    block.eval()
+    assert block.shortcut is None
+
+    with torch.no_grad():
+        block.conv1.weight.zero_()
+        block.conv2.weight.zero_()
+
+    torch.testing.assert_close(block(input), input)
 
 
 def test_forward_shape() -> None:
