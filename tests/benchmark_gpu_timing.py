@@ -34,7 +34,7 @@ class ModelConfig:
 class BenchmarkResult:
     model_name: str
     name: str
-    amp_dtype: str
+    precision: str
     compile_mode: str
     optimizer_step: str
     storage_sync: str
@@ -56,6 +56,13 @@ def _single_loss(logits: Tensor, target: Tensor) -> Tensor:
 def _packed_loss(logits: Tensor, target: Tensor) -> Tensor:
     batch_size, num_models, num_classes = logits.shape
     return F.cross_entropy(logits.reshape(batch_size * num_models, num_classes), target.reshape(-1))
+
+
+def _configure_precision(amp: str) -> torch.dtype | None:
+    use_tf32 = amp != "bf16"
+    torch.set_float32_matmul_precision("high" if use_tf32 else "highest")
+    torch.backends.cudnn.allow_tf32 = use_tf32
+    return torch.bfloat16 if amp == "bf16" else None
 
 
 def _time_forward_backward(
@@ -112,7 +119,7 @@ def _time_forward_backward(
     return BenchmarkResult(
         model_name=model_name,
         name=name,
-        amp_dtype="bf16" if amp_dtype is torch.bfloat16 else "fp32",
+        precision="bf16" if amp_dtype is torch.bfloat16 else "tf32",
         compile_mode=compile_mode or "eager",
         optimizer_step="yes" if include_optimizer_step else "no",
         storage_sync="yes" if include_storage_sync else "no",
@@ -241,7 +248,7 @@ def _print_results(results: list[BenchmarkResult]) -> None:
     header = (
         "model",
         "case",
-        "amp",
+        "prec",
         "compile",
         "optim",
         "sync",
@@ -263,7 +270,7 @@ def _print_results(results: list[BenchmarkResult]) -> None:
     )
     for result in results:
         print(
-            f"{result.model_name:<8} {result.name:<8} {result.amp_dtype:<5} "
+            f"{result.model_name:<8} {result.name:<8} {result.precision:<5} "
             f"{result.compile_mode:<16} {result.optimizer_step:<5} {result.storage_sync:<5} "
             f"{result.local_batch_size:>8} {result.num_models:>4} {result.global_batch_size:>9} "
             f"{result.mean_ms:>10.3f} {result.median_ms:>10.3f} "
@@ -320,7 +327,7 @@ def parse_args() -> argparse.Namespace:
         "--amp",
         choices=("none", "bf16"),
         default="none",
-        help="Enable CUDA AMP autocast for forward/loss computation.",
+        help="Enable CUDA AMP autocast for forward/loss computation. Non-AMP runs use TF32.",
     )
     parser.add_argument(
         "--compile",
@@ -364,7 +371,8 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda")
-    amp_dtype = torch.bfloat16 if args.amp == "bf16" else None
+    amp_dtype = _configure_precision(args.amp)
+    precision = "bf16 AMP" if amp_dtype is torch.bfloat16 else "TF32"
     compile_mode = args.compile_mode if args.compile else None
     model_names = MODEL_CONFIGS.keys() if args.model == "all" else (args.model,)
     model_configs = [
@@ -375,7 +383,7 @@ def main() -> None:
     print(f"device: {torch.cuda.get_device_name(device)}")
     print(f"torch: {torch.__version__}")
     print(f"models: {', '.join(config.name for config in model_configs)}, input: {IMAGE_SHAPE}")
-    print(f"amp: {args.amp}, compile: {compile_mode or 'eager'}")
+    print(f"precision: {precision}, compile: {compile_mode or 'eager'}")
     print(f"include_optimizer_step: {args.include_optimizer_step}")
     print(f"include_storage_sync: {args.include_storage_sync}")
     print(f"batch_sizes: {args.batch_sizes}, num_models: {args.num_models}")

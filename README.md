@@ -23,6 +23,30 @@ packed with one independent weight matrix per local model.
 Packed models initialize model 0 once and broadcast its parameters to every
 other local model, so all local models start from identical parameters.
 
+## Numerical Precision
+
+Packed and standalone models are mathematically equivalent, but they are not
+expected to be bitwise identical on CUDA. Packed convolutions use one grouped
+convolution while standalone models use separate convolutions, and packed
+BatchNorm processes `K * C` channels in one operation. cuDNN may select
+different kernels and reduction orders for these tensor shapes.
+
+In FP32, the resulting output and gradient differences are normally close to
+floating-point roundoff. TF32 and BF16 increase the differences because tensor
+core multiplications use reduced-precision inputs. Tests should therefore use
+precision-appropriate tolerances while continuing to require exact isolation:
+changing or differentiating through one local model must not affect another
+local model. Reduced precision can also produce a small downward bias in
+BatchNorm running variances relative to an IEEE FP32 reference.
+
+For CUDA Wide ResNet benchmarks, convolution precision is controlled by
+`torch.backends.cudnn.allow_tf32`, while
+`torch.set_float32_matmul_precision()` controls matrix multiplications such as
+the classifier. Changing only the matmul setting may have little effect because
+the benchmark is dominated by convolutions. The benchmark script configures
+both controls: non-AMP runs use TF32, and `--amp bf16` uses BF16 autocast with
+TF32 disabled for FP32 fallback operations.
+
 ## Packed Distributed Dataloaders
 
 `create_dataloader` downloads MNIST, CIFAR10, or CIFAR100 and keeps the complete
@@ -161,7 +185,7 @@ uv run python tests/benchmark_gpu_timing.py --include-storage-sync
 uv run python tests/benchmark_gpu_timing.py --compile --batch-sizes 16 --num-models 8
 ```
 
-The benchmark times WRN16-8 by default, with WRN28-10 available via
+The benchmark times WRN16-8 with TF32 by default, with WRN28-10 available via
 `--model wrn28-10`. Use `--model all` to run both. Each selected model is timed
 for forward+backward on CUDA across:
 
@@ -169,7 +193,7 @@ for forward+backward on CUDA across:
 - packed local batch sizes: `16`, `32`, `64`
 - packed model counts: `8`, `16`, `32`
 
-Use `--amp bf16` to time BF16 CUDA autocast. Use `--compile` to run
+Use `--amp bf16` to replace TF32 with BF16 CUDA autocast. Use `--compile` to run
 `torch.compile` before warmup; `--compile-mode` accepts `default`,
 `reduce-overhead`, or `max-autotune`. Use at least one warmup step with
 `--compile` to keep first-time compilation outside the timed region. For quick

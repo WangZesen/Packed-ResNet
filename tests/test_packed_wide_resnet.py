@@ -33,18 +33,18 @@ def _packed_input(batch_size: int, num_models: int, channels: int = 3) -> torch.
     return _channels_last_input(batch_size, num_models * channels)
 
 
+def _local_tensor_view(tensor: torch.Tensor, num_models: int) -> torch.Tensor:
+    local_numel = tensor.numel() // num_models
+    if tensor.is_contiguous():
+        return tensor.view(num_models, local_numel)
+    assert tensor.ndim == 4
+    assert tensor.is_contiguous(memory_format=torch.channels_last)
+    return tensor.as_strided((num_models, local_numel), (local_numel, 1))
+
+
 def _assert_local_parameters_identical(model: PackedWideResNet) -> None:
     for parameter in model.parameters():
-        local_numel = parameter.numel() // model.num_models
-        if parameter.is_contiguous():
-            local_parameters = parameter.view(model.num_models, local_numel)
-        else:
-            assert parameter.ndim == 4
-            assert parameter.is_contiguous(memory_format=torch.channels_last)
-            local_parameters = parameter.as_strided(
-                (model.num_models, local_numel),
-                (local_numel, 1),
-            )
+        local_parameters = _local_tensor_view(parameter, model.num_models)
         torch.testing.assert_close(
             local_parameters,
             local_parameters[0].unsqueeze(0).expand_as(local_parameters),
@@ -283,6 +283,73 @@ def test_packed_model_matches_normal_wide_resnet_forwards() -> None:
     torch.testing.assert_close(packed_logits, separate_logits, rtol=1e-5, atol=1e-5)
 
 
+def test_training_packed_model_matches_separate_models_outputs_gradients_and_batch_norm() -> None:
+    torch.manual_seed(0)
+    models = [WideResNet(depth=10, widen_factor=1, num_classes=6) for _ in range(2)]
+    packed = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=6)
+    copy_single_models_into_packed(packed, models)
+    x = _packed_input(4, 2)
+
+    packed_logits = packed(x)
+    separate_logits = torch.stack(
+        [
+            model(x[:, idx * 3 : (idx + 1) * 3].contiguous(memory_format=torch.channels_last))
+            for idx, model in enumerate(models)
+        ],
+        dim=1,
+    )
+    output_gradient = torch.randn_like(packed_logits)
+    packed_logits.backward(output_gradient)
+    separate_logits.backward(output_gradient)
+
+    torch.testing.assert_close(packed_logits, separate_logits, rtol=1e-5, atol=1e-5)
+    separate_parameters = [dict(model.named_parameters()) for model in models]
+    for name, parameter in packed.named_parameters():
+        assert parameter.grad is not None
+        expected_gradients = []
+        for model_parameters in separate_parameters:
+            reference_gradient = model_parameters[name].grad
+            assert reference_gradient is not None
+            expected_gradients.append(_local_tensor_view(reference_gradient, 1)[0])
+        torch.testing.assert_close(
+            _local_tensor_view(parameter.grad, packed.num_models),
+            torch.stack(expected_gradients),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    packed_modules = dict(packed.named_modules())
+    separate_modules = [dict(model.named_modules()) for model in models]
+    for name, module in packed_modules.items():
+        if not isinstance(module, PackedBatchNorm2d):
+            continue
+        assert module.running_mean is not None
+        assert module.running_var is not None
+        assert module.num_batches_tracked is not None
+        for model_idx, model_modules in enumerate(separate_modules):
+            reference = model_modules[name]
+            assert isinstance(reference, torch.nn.BatchNorm2d)
+            start = model_idx * module.local_num_features
+            end = start + module.local_num_features
+            torch.testing.assert_close(module.running_mean[start:end], reference.running_mean)
+            torch.testing.assert_close(module.running_var[start:end], reference.running_var)
+            torch.testing.assert_close(module.num_batches_tracked, reference.num_batches_tracked)
+
+
+def test_changing_one_local_model_input_does_not_change_other_outputs() -> None:
+    torch.manual_seed(0)
+    model = PackedWideResNet(depth=10, widen_factor=1, num_models=3, num_classes=6).eval()
+    x = _packed_input(4, 3)
+    changed_x = x.clone()
+    changed_x[:, :3].add_(10)
+
+    output = model(x)
+    changed_output = model(changed_x)
+
+    assert not torch.allclose(output[:, 0], changed_output[:, 0])
+    torch.testing.assert_close(output[:, 1:], changed_output[:, 1:], rtol=0, atol=0)
+
+
 def test_packed_parameter_storage_rows_match_normal_models_after_copy() -> None:
     torch.manual_seed(0)
     models = [WideResNet(depth=10, widen_factor=1, num_classes=6) for _ in range(3)]
@@ -351,6 +418,37 @@ def test_gradient_isolation_between_local_models() -> None:
     assert classifier.weight.grad is not None
     assert torch.count_nonzero(classifier.weight.grad[0]) > 0
     assert torch.count_nonzero(classifier.weight.grad[1]) == 0
+
+
+def test_gradients_are_isolated_for_every_parameter() -> None:
+    torch.manual_seed(0)
+    model = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=4)
+    x = _packed_input(2, 2)
+
+    model(x)[:, 0].sum().backward()
+
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None, name
+        local_gradients = _local_tensor_view(parameter.grad, model.num_models)
+        assert torch.count_nonzero(local_gradients[1]) == 0, name
+
+
+def test_batch_norm_affine_parameters_are_mixed_but_buffers_are_excluded() -> None:
+    torch.manual_seed(0)
+    model = PackedWideResNet(depth=10, widen_factor=1, num_models=2, num_classes=4)
+    model(_packed_input(4, 2))
+    buffers_before = {name: buffer.detach().clone() for name, buffer in model.named_buffers()}
+    batch_norms = [module for module in model.modules() if isinstance(module, PackedBatchNorm2d)]
+
+    with torch.no_grad():
+        model.parameter_storage.zero_()
+    model.sync_parameters_from_storage_()
+
+    for batch_norm in batch_norms:
+        assert torch.count_nonzero(batch_norm.weight) == 0
+        assert torch.count_nonzero(batch_norm.bias) == 0
+    for name, buffer in model.named_buffers():
+        torch.testing.assert_close(buffer, buffers_before[name], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("bias", [False, True])
